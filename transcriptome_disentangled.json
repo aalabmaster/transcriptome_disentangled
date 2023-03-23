@@ -1,0 +1,9 @@
+{
+  "paths" : {
+      "raw"     : "C:/database/transcriptome_disentangled/raw",
+      "clean"   : "C:/database/transcriptome_disentangled/clean",
+      "scratch" : "C:/database/transcriptome_disentangled/scratch"
+	 }
+}
+
+

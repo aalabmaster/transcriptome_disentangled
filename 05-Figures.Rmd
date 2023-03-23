@@ -1,0 +1,633 @@
+
+---
+title: "Generating Figures for the Paper"
+author: "Amir Asiaee"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+```{r globopt, echo=FALSE}
+knitr::opts_chunk$set(fig.width=12) 
+```
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+# Getting Started
+Getting started!
+```{r globals}
+rm(list=ls())
+source("00-paths.R")
+ls()
+rm(tcgapaths, tfacpaths)
+
+load(file.path(paths$clean, "matchedData.Rda"))
+# Removing GBM
+rm(miRdata, mRNAdata)
+length(cancerType)
+gbmIndex <- which(cancerType == 'GBM')
+cancerType <- cancerType[-gbmIndex]
+cancerType <- droplevels(cancerType)
+cohortColors <- cohortColors[-gbmIndex]
+sampleType <- sampleType[-gbmIndex]
+
+load(file.path(paths$scratch, paste('medoids_tf_all.Rda', sep = '')))
+load(file.path(paths$scratch, paste('medoids_mir_all.Rda', sep = '')))
+X1 <- as.data.frame(cbind(tfMedoid, mirMedoid))
+X <- data.frame(X1, ctype = cancerType)
+```
+
+
+# Feature Selection
+```{r all thresher, warning = FALSE, echo=FALSE}
+cancerMean <- aggregate(. ~ ctype, X, mean)
+cancerCenters <- as.matrix(cancerMean[, -1])
+row.names(cancerCenters) <- as.character(cancerMean[,1])
+
+library(beanplot)
+baselev <- levels(cancerType)
+
+outputDir <- file.path(paths$clean, 'figures') 
+if (!dir.exists(outputDir)) 
+  dir.create(outputDir)
+
+for (k in 1:ncol(X1)) {
+  scaler <- 1024
+  ot <- order(cancerMean[,k+1])
+  tempType <- factor(cancerType, levels=baselev[ot])
+  png(file=file.path(outputDir, paste("component", k, ".png", sep='')), 
+    pointsize=36, width=5*scaler, height=1.5*scaler)
+  # beanplot(X1[,k] ~ tempType, bw="ucv", col=as.list(cohortColors[ot[]]), 
+           # what=c(1,1,1,0), log = "", main=paste("Component", k))
+  boxplot(X1[,k] ~ tempType, col=cohortColors[ot[]], main=paste("Component", k))
+  dev.off()
+}
+
+```
+
+# Classification
+
+```{r gbm removal, warning = FALSE, echo=FALSE}
+library(viridis)
+library(e1071)
+library(caret)
+library(ComplexHeatmap)
+
+f <- file.path(paths$scratch, 'cv-SVM-noGBM.rda')
+
+if(file.exists(f)){
+  load(f)
+} else {
+  nfolds <- 10
+  nTrain <- nrow(X)
+  medSvmList <- pmedSvmList <- cfmedSvmList <- list()
+  foldsId <- sample(rep(1:nfolds, length.out = nTrain), replace = F)
+  cfmedSvmMean <- matrix(0, nrow=31, ncol=31)
+  for (k in 1:nfolds) {
+    print(paste("Fold", k, "started."))
+    testId <- which(foldsId == k)
+    train <- X[-testId, ]; 
+    test <- X[testId, ];
+    
+    medSvm <- svm(ctype ~ ., train)
+    pmedSvm <- predict(medSvm, test[,-ncol(test)])
+    cfmedSvm <- confusionMatrix(pmedSvm, test$ctype)
+    print(cfmedSvm$overall)
+  
+    medSvmList[[k]] <- medSvm
+    pmedSvmList[[k]] <- pmedSvm
+    cfmedSvmList[[k]] <- cfmedSvm
+    temp <- as.data.frame.matrix(cfmedSvm$table)
+    cfmedSvmMean <- cfmedSvmMean + as.matrix(temp)
+  }
+  cfmedSvmMean <- cfmedSvmMean / nfolds
+  cat("Average Accuracy:", mean(sapply(cfmedSvmList, function(x) x$overall['Accuracy'])))
+  save(cfmedSvmMean, medSvmList, pmedSvmList, cfmedSvmList, file = f)
+}
+
+res <- 300
+# png(file=file.path(paths$figures, 'classification.png'), 
+           # width=16*res, height=9*res, res=res, bg="white")
+tempM <- cfmedSvmMean
+diag(tempM) <- NA
+heatmap(as.table(tempM), Rowv=NA, Colv = NA, col=viridis(256), main = "Average Confusion Matrix for 10-fold Cross Validation", scale = 'none')
+# dev.off()
+  
+cat("Average Accuracy:", mean(sapply(cfmedSvmList, function(x) x$overall['Accuracy'])))
+rm(cfmedSvm,cfmedSvmList, cfmedSvmMean, medSvm, medSvmList, pmedSvm, pmedSvmList, train, foldsId, k, nfolds, nTrain, testId)
+rm(mirMedoid, tfMedoid, temp)
+```
+
+
+```{r tsne, warning = FALSE, echo=FALSE}
+library(Rtsne)
+f <- file.path(paths$scratch, "tsneData-joint-truth.rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  set.seed(97531)
+  cancers <- Rtsne(X1, initial_dims = 60)
+  colvec <- cohortColors[as.character(cancerType)]
+  sym <- c(16, 1, 8)[as.numeric(sampleType)]
+  xcent <- tapply(cancers$Y[,1], list(cancerType), median)
+  ycent <- tapply(cancers$Y[,2], list(cancerType), median)
+  save(cancers, colvec, sym, xcent, ycent, file = f)
+}
+
+medSvm <- svm(ctype ~ ., X)
+pmedSvm <- predict(medSvm, X)
+cfmedSvm <- confusionMatrix(pmedSvm, X$ctype)
+print(cfmedSvm$overall)
+colvec1 <- cohortColors[as.character(pmedSvm)]
+ 
+# res <- 300
+# png(file=file.path(paths$figures, 'classification-tsne.png'), 
+#            width=16*res, height=9*res, res=res, bg="white")
+
+par(mfrow=c(1,2))
+
+plot(cancers$Y, pch=sym, col=colvec, xlab="T1", ylab="T2", cex=0.8, main="Ground Truth")
+text(xcent, ycent, levels(cancerType), col='black', cex=1.5)
+ 
+library(viridis)
+colvec2 <- rep(viridis(5)[3], length(colvec1))
+colvec2[colvec != colvec1] <- viridis(5)[5]
+plot(cancers$Y, pch=sym, col=colvec2, xlab="T1", ylab="T2", cex=0.8, main="Classification")
+rect(par("usr")[1], par("usr")[3],
+     par("usr")[2], par("usr")[4],
+     col = "lavender")
+par(new = TRUE)
+plot(cancers$Y, pch=sym, col=colvec2, xlab="T1", ylab="T2", cex=0.8, main="Classification")
+text(xcent, ycent, levels(cancerType), col='black', cex=1.5)
+
+# dev.off()
+
+par(mfrow=c(1,1))
+
+    
+rm(f)
+```
+
+# Regression
+
+## Tissue-Agnostic & Aware - No Train/Test Split
+
+```{r , warning = FALSE, echo=FALSE}
+load(file.path(paths$scratch, "jointMedoidR2.Rda"))
+allR2 <- data.frame(agnostic = r2s)
+load(file.path(paths$scratch, "tissueMedoidR2.Rda"))
+allR2 <- data.frame(allR2, aware = r2s)
+rm(r2s)
+```
+
+```{r determine k by bic, warning = FALSE, echo=FALSE}
+# Run the EM 10 times for the range of the K=1...5 components:
+# Since we don't have observations in the whole range the mle estimate will not work. So we change it to mme:
+valTrsh <- 1E-5
+
+f <- file.path(paths$scratch, 'betaModels-agnostic-aware.Rda')
+if(file.exists(f)){
+  load(f)
+} else {
+  library(fitdistrplus)
+  library(BetaModels)
+  set.seed(1234)
+  betaModels <- list()
+  K <- 4
+  B <- 10
+  for (expR2 in colnames(allR2)) {
+    tempData <- allR2[,expR2]
+    n <- length(tempData)
+    tempData[tempData < valTrsh] <- valTrsh
+    tempData[tempData > 1 - valTrsh] <- 1 - valTrsh
+    betaModels[[expR2]] <- list()
+    for (k in 1:K) {
+      tempList <- list()
+      for (b in 1:B) {
+        print(paste(expR2, ", k = ", k, ", b = ", b))
+        index <- sample(1:n, n, replace = T)
+        if (k == 1) {
+          output <- fitdist(tempData[index], "beta", "mle")
+          params <- matrix(c(1, output$estimate), ncol = 1)
+        } else {
+          output <- BetaMixture(tempData[index], K = k, forever = 50, epsilon = 0.02)
+          params <- rbind(output@phi, output@mle)
+        }
+        rownames(params) <- c("pi", "alpha", "beta")
+        tempList[[length(tempList)+1]] <- params
+      }
+      betaModels[[expR2]][[k]] <- tempList
+    }
+  }
+  save(betaModels, file = f)
+}
+```
+
+```{r bicCompute, warning = FALSE, echo=FALSE}
+# Find the best k
+#We need to compute the BIC score for each k and average that over the ten runs that we did. 
+
+betaMixtureLL <- function(dataVec, params){
+  likelihood <- rep(0, length(dataVec));
+  for(i in 1:ncol(params)){
+    likelihood <- likelihood + params[1, i] * dbeta(dataVec, params[2,i], params[3, i]);
+  }
+  return (sum(log(likelihood)));
+}
+
+betaMixtureBic <- function(dataVec, params){
+  k <- ncol(params);
+  n <- length(dataVec);
+  loglikelihood <- betaMixtureLL(dataVec, params);
+  return (-2 * loglikelihood + (3*k - 1) * log(n));
+}
+```
+
+```{r plotBic, warning = FALSE, echo=FALSE}
+#First preparing ggplot2 library:
+library(ggplot2)
+library(grid)
+library(gridExtra)
+theme_set(theme_minimal() + 
+            theme(axis.line = element_line(colour = "black"),
+                  panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  panel.border = element_blank(),
+                  panel.background = element_blank(),
+                  title = element_text(size = 16)));
+
+plotBic <- function(dfData, dfSlope, tempData, expR2, title){
+  x <- seq(0, 1, len = length(tempData))
+  
+  p0 <- ggplot(as.data.frame(tempData), aes(tempData)) + 
+    geom_histogram(aes(y=..density..), color = "black", fill = "white", binwidth = .01) +
+    xlab(expression(R^2)) + ylab('Density') + xlim(c(0,1))
+  
+  p1 <- ggplot(dfData, aes(x = x, y = y)) +
+    geom_point()+ geom_line() +
+    xlab("k: Number of Components") + ylab("BIC Score") + 
+    geom_errorbar(aes(ymin = y - dy, ymax = y + dy), width=.05) + 
+    xlim(c(1,K));
+
+  p2 <- ggplot(dfSlope, aes(x = x, y = y)) +
+    geom_point()+ geom_line() +
+    xlab("k: Number of Components") + ylab("Derivative of BIC Score") + 
+    geom_errorbar(aes(ymin = y - dy, ymax = y + dy), width=.05) + 
+    xlim(c(1,K-1));
+
+  grid.newpage()
+  pushViewport(viewport(layout = grid.layout(
+        nrow = 2,
+        ncol = 3,
+        heights = c(0.1, 0.9))))
+  grid.text(title, vp = viewport(layout.pos.row = 1, layout.pos.col = 1:3))
+  print(p0, vp = viewport(layout.pos.row = 2, layout.pos.col = 1))
+  print(p1, vp = viewport(layout.pos.row = 2, layout.pos.col = 2))
+  print(p2, vp = viewport(layout.pos.row = 2, layout.pos.col = 3))
+}
+```
+
+
+```{r bic-k, warning=FALSE, echo=FALSE}
+# Find the best k by taking the derivative:
+K <- 4
+B <- 10
+bicDerivative <- bic <- vector("list", length(colnames((allR2))))
+names(bicDerivative) <- names(bic) <- colnames((allR2))
+titles <- c("Tissue-Agnostic Model", "Tissue-Aware Model")
+for (i in 1:ncol(allR2)) {
+  expR2 <- colnames(allR2)[i]
+  title <- titles[i]
+  tempData <- allR2[,expR2]
+  tempData[tempData < valTrsh] <- valTrsh
+  tempData[tempData > 1 - valTrsh] <- 1 - valTrsh
+  
+  bicDerivative[[expR2]] <- bic[[expR2]] <- matrix(0, nrow = B, ncol = K);
+  # For plotting
+  dfData <- data.frame(matrix(nrow = K, ncol = 3))
+  dfSlope <- data.frame(matrix(rep(0, K*3), nrow = K, ncol = 3))
+  colnames(dfData) <- colnames(dfSlope) <- c('x', 'y', 'dy')
+  for (k in 1:K) {
+    print(paste(expR2, ", k = ", k))
+    for (b in 1:B) {
+      params <- betaModels[[expR2]][[k]][[b]]
+      bic[[expR2]][b, k] <- betaMixtureBic(tempData, params)
+      if(k > 1)
+        bicDerivative[[expR2]][b, k-1] <- bic[[expR2]][b, k] - bic[[expR2]][b, k-1]
+    }
+    dfData[k,] <- c(k,
+                    mean(bic[[expR2]][,k]),
+                    sd(bic[[expR2]][,k]))
+    if(k > 1){ 
+      dfSlope[k-1,] <- c(k-1,
+                       mean(bicDerivative[[expR2]][,k-1]),
+                       sd(bicDerivative[[expR2]][,k-1]))
+    }
+  }
+  plotBic(dfData, dfSlope, tempData, expR2, title)
+}
+```
+
+
+```{r bestk, warning = FALSE, , echo=FALSE}
+#Fitting the best K once with more precision:
+library(fitdistrplus)
+bestK <- c(2, 2) #manually entered 
+bestBetaParameters <- bestBetaModels <- list()
+
+
+bestModelsFileName <- file.path(paths$scratch, 'bestBetaModels-final-ag-aw.Rda')
+bestParamsFileName <- file.path(paths$scratch, 'bestBetaParams-final-ag-aw.Rda')
+if (!file.exists(bestParamsFileName)) {
+  for (i in 1:ncol(allR2)) {
+    expR2 <- colnames(allR2)[i]
+    tempData <- allR2[, expR2]
+    tempData[tempData < 1E-10] <- 1E-10
+    tempData[tempData > 1 - 1E-10] <- 1 - 1E-10
+    myK <- bestK[i]
+    
+    if (myK == 1) {
+      output <- fitdist(tempData, "beta", "mle")
+      params <- matrix(c(1, output$estimate), ncol = 1)
+    } else {
+      output <-
+        BetaMixture(tempData,
+                    K = myK,
+                    forever = 100,
+                    epsilon = 0.001)
+      params <- rbind(output@phi, output@mle)
+    }
+    bestBetaModels[[expR2]] <- output
+    rownames(params) <- c("pi", "alpha", "beta")
+    bestBetaParameters[[expR2]] <- params
+  }
+  save(bestBetaParameters, file = bestParamsFileName)
+  save(bestBetaModels, file = bestModelsFileName)
+  
+} else {
+  load(bestParamsFileName)
+  load(bestModelsFileName)
+}
+```
+
+
+```{r , warning = FALSE, echo=FALSE}
+
+library(ggplot2)
+library(Polychrome)
+myColors <- light.colors(5)
+titles <-
+  c("Transcriptome Prediction with 56 Regulatory Elements:\nTissue-Agnostic Model", "Transcriptome Prediction with 56 Regulatory Elements:\nTissue-Aware Model")
+modAllData <- allR2;
+mixtureAllDataFileName <- file.path(paths$scratch, 'mixtureAllData-ag-aw.Rda')
+
+
+for (i in 1:ncol(allR2)) {
+  label <- c('poor', 'well')
+  expR2 <- colnames(allR2)[i]
+  params <- bestBetaParameters[[expR2]]
+  expTitle <- titles[i]
+  tempData <- allR2[, expR2]
+  tempData[tempData < 1E-10] <- 1E-10
+  tempData[tempData > 1 - 1E-10] <- 1 - 1E-10
+  
+  if (bestK[i] > 1) {
+    #for the first three models
+    model <- bestBetaModels[[expR2]]
+    tMember <- apply(model@Z, 1, which.max)
+    low <- tempData < .5
+    # swap poor/well labels
+    poorComp <- paste(expR2, '.', 'poor', sep = "")
+    wellComp <- paste(expR2, '.', 'well', sep = "")
+    
+    modAllData <- cbind(modAllData,  as.data.frame(matrix(rep(NA, 2*length(model@datavec)), ncol=2)))
+    colnames(modAllData)[(ncol(modAllData) - 1):ncol(modAllData)] <- c(poorComp, wellComp)
+    if (mean(tempData[tMember == 1]) > mean(tempData[tMember == 2])) {
+      modAllData[[wellComp]][tMember == 1] <- tempData[tMember == 1 | !low]
+      modAllData[[poorComp]][tMember == 2] <- tempData[tMember == 2 & low]
+    } else {
+      modAllData[[wellComp]][tMember == 2] <- tempData[tMember == 2 | !low]
+      modAllData[[poorComp]][tMember == 1] <- tempData[tMember == 1 & low]
+    }
+  }
+  
+  p0 <- NULL
+  x <- seq(0, 1, len = length(tempData))
+  p0 <- ggplot(as.data.frame(tempData), aes(tempData)) +
+    geom_histogram(
+      aes(y = ..density..),
+      color = "black",
+      fill = "white",
+      binwidth = .01
+    ) +
+    xlab(expression(R ^ 2)) + ylab('Density') + ggtitle(expTitle) + xlim(c(0, 1))
+  for (j in 1:ncol(params)) {
+    p0 <- p0 + stat_function(
+      aes(x = x),
+      fun = function(x, j)
+      {
+        params[1, j] * dbeta(x, shape1 = params[2, j], shape2 = params[3, j])
+      },
+      colour = myColors[j],
+      n = 1000,
+      size = 1.5,
+      args = list(j = j)
+    )
+  }
+  print(p0)  
+}
+
+save(modAllData, file = mixtureAllDataFileName)
+
+```
+
+### Tail Analysis
+```{r tail , warning = FALSE}
+for (i in 1:ncol(allR2)) {
+  expR2 <- colnames(allR2)[i]
+  f <- file.path(paths$scratch, paste(paste('tails_poor', expR2, sep = '_'),'.csv',sep = ''))
+  g <- file.path(paths$scratch, paste(paste('tails_well', expR2, sep = '_'),'.csv',sep = ''))
+
+  params <- bestBetaParameters[[expR2]]
+  bMeans <- params[2,] / (params[2,] + params[3,])
+  pIndex <- which.min(bMeans)
+  wIndex <- which.max(bMeans)
+  
+  pThrsh <- qbeta(.05, shape1 = params[2, pIndex], shape2 = params[3, pIndex])
+  wThrsh <- qbeta(.99, shape1 = params[2, wIndex], shape2 = params[3, wIndex])
+
+  write.csv(rownames(modAllData)[allR2[,expR2] < pThrsh], file = f)
+  write.csv(rownames(modAllData)[allR2[,expR2] > wThrsh], file = g)
+
+}
+
+
+```
+
+## Tissue-Aware - Train/Test Split - Pick Number of Labels
+
+```{r plot, warning = FALSE, echo=FALSE}
+library(ggplot2)
+nClusters <- c(1, 5, 10, 15, 20, 25, 30, 35)
+
+plot.cv <- function(cvtrain, cvtest, ytext){
+  yt <- colMeans(cvtest)
+  et <- apply(cvtest, 2, sd)
+  
+  yn <- colMeans(cvtrain)
+  en <- apply(cvtrain, 2, sd)
+  
+  toplot <- data.frame(yt = yt,et = et,yn = yn,en = en,nc = nClusters)
+  
+  ggplot(toplot) +
+    geom_line(aes(x = nc, y = yt, col = "Test"), size = 1) +
+    geom_point(aes(x = nc, y = yt, shape = 'a'), show.legend = FALSE) +
+    geom_line(aes(x = nc, y = yn, col = "Train"), size = 1) +
+    geom_point(aes(x = nc, y = yn, shape = 'c'), show.legend = FALSE) +
+    geom_errorbar(aes(x = nc,ymin = yt - et,ymax = yt + et), width = 0.5) +
+    geom_errorbar(aes(x = nc,ymin = yn - en,ymax = yn + en), width = 0.5) +
+    theme_bw() + xlab("Number of Clusters") + ylab(ytext) +
+    scale_color_manual(values = c("red", "green"), name = "")
+}
+
+load(file.path(paths$scratch, 'cvTables.Rda'))
+
+plot.cv(cvRmseTrn, cvRmseTst, "RMSE")
+plot.cv(cvCorrTrn, cvCorrTst, "Correlation Score")
+
+
+toplotr2 <- data.frame(yt = colMeans(cvR2Trn),
+                       et = apply(cvR2Trn, 2, sd),nc = nClusters)
+ggplot(toplotr2) +
+    geom_line(aes(x = nc, y = yt), size = 1.5) +
+    geom_point(aes(x = nc, y = yt, shape = 'a'), show.legend = FALSE) +
+    geom_errorbar(aes(x = nc,ymin = yt - et,ymax = yt + et), width = 0.5) +
+    theme_bw() + xlab("Number of Clusters") + ylab("Average R2") 
+
+rm(toplotr2, cvRmseTst, cvRmseTrn, cvCorrTrn, cvCorrTst, cvR2Trn)
+rm(list=ls())
+source("00-paths.R")
+rm(tcgapaths, tfacpaths)
+```
+
+
+### TF and MiR Histograms for GTEx
+
+```{r load medoids, warning = FALSE, echo=FALSE}
+load(file.path(paths$scratch, paste('medoids_tf_all.Rda', sep = '')))
+load(file.path(paths$scratch, paste('medoids_mir_all.Rda', sep = '')))
+```
+
+```{r gtf, warning = FALSE, echo=FALSE}
+load(file.path(paths$scratch, "gtexTFMed.Rda"))
+colnames(tfMedoid)[1] == colnames(gtexTFMed)[1]
+```
+
+#### TF Comparison
+```{r hist comparison , warning = FALSE, echo=FALSE}
+par(mfrow=c(1,2))
+for(i in 1:28){
+  hist(tfMedoid[,i], breaks=123, main="TF Medoid from TCGA", xlab=paste("TF", colnames(tfMedoid)[i]), freq=F )
+  hist(gtexTFMed[,i], breaks=123, main="TF Medoid from GTEx", xlab=paste("TF", colnames(tfMedoid)[i]), freq=F)
+
+}
+```
+
+#### Mir Comparison 
+
+```{r miR comparison, warning = FALSE, echo=FALSE}
+# Let's do the same for miRs. The point is that we can not eaily match all of the miRs so we just use the 18/28 that we can match directly in the first try. 
+
+load(file.path(paths$clean, "gtexMir.Rda"))
+
+converMirNames <- function (longMirs){
+  shortMirs <- sapply(longMirs, function(x) substr(x, 9, nchar(x)))
+  
+  shortMirs <- sapply(shortMirs, function(x) {
+    aa <- gregexpr(pattern = '-3p', x)
+    index <- aa[[1]][[1]]
+    return (ifelse(index != -1, substr(x, 1, index - 1), x))
+  })
+  
+  shortMirs <- sapply(shortMirs, function(x) {
+    aa <- gregexpr(pattern = '-5p', x)
+    index <- aa[[1]][[1]]
+    return (ifelse(index != -1, substr(x, 1, index - 1), x))
+  })
+  
+  shortMirs <-
+    sapply(shortMirs, function(x) paste("MIR", x, sep = ""))
+  names(shortMirs) <- NULL
+  shortMirs <- toupper(shortMirs)
+  return(shortMirs)
+}
+shortMirs <- converMirNames(colnames(mirMedoid))
+
+colnames(mirMedoid) <- shortMirs
+
+easyMirs <- intersect(rownames(gtexMir), shortMirs)
+
+
+
+
+gtexMirMed <- t(gtexMir[easyMirs, ])
+dim(gtexMirMed)
+
+par(mfrow=c(1,2))
+for(i in 1:length(easyMirs)){
+  curMir <- easyMirs[i]
+  hist(mirMedoid[,curMir], breaks=123, main="miR Medoid from TCGA", xlab=paste("miR", curMir), freq=F )
+  hist(gtexMirMed[,curMir], breaks=123, main="miR Medoid from GTEx", xlab=paste("miR", curMir), freq=F)
+}
+rm(list=ls())
+gc()
+source("00-paths.R")
+```
+
+
+### TF Only Result for GTEx
+Here the goal is to ignore the miRs and also Train/Test. We assume that the correct number of parameters is 15 for clusters and we learn 15 clusters using only TFs. And we do not do train/test split, we use the whole TCGA data (for which we already know the thresher's output for TFs) once to learn 15 clusters and for each one of them a linear model. Then we test that linear model on GTEx.
+
+```{r , warning = FALSE}
+load(f <- file.path(paths$scratch,'tf_final_model_15.Rda'))
+cat("TCGA-TF:")
+cat(paste("\n    Averge R2:", round(mean(model$r2, na.rm = T),2)))
+cat(paste("\n    Averge RMSE:", round(mean(model$rmse),2)))
+cat(paste("\n    Averge Cor:", round((model$corr$acc),2)))
+
+load(file.path(paths$scratch, 'tf_gtex_test_15.Rda'))
+cat("\n GTEx:")
+cat(paste("\n    Averge RMSE:", round(mean(gtexResults$rmse),2)))
+cat(paste("\n    Averge Cor:", round((gtexResults$corr$acc),2)))
+```
+
+    
+    
+
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+
+```
+
+
+
+

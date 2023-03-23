@@ -1,0 +1,439 @@
+---
+title: "Thresher and R2 Analysis on Matched TCGA Data - Medoids Instead of Scores"
+author: "Amir Asiaee, Zach Abrams, Kevin R. Coombes"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+# Getting Started
+First, we load some global information about where to find data folders. 
+```{r globals}
+rm(list=ls())
+library(cmapR)
+source("00-paths.R")
+```
+
+We load the matched TCGA data (has both mRNA and miRdata): 
+
+```{r tcgaloading, warning = FALSE}
+load(file = file.path(paths$clean, "matchedData.Rda"))
+dim(mRNAdata)
+namesMrnaAll <- rownames(mRNAdata)
+save(namesMrnaAll, file = file.path(paths$scratch, "allMrnaNames.Rda"))
+dim(miRdata)
+rownames(miRdata)[sample(nrow(miRdata))[1:20]]
+```
+You see that we have directionality for mature miRNAs, which is missing in the GTEx data. As far as I can tell the abundance of both directions can be equal or drastically different. We should probably ignore the directionality when we want to select the corresponding miRs medoids from the GTEx (we have to!). Also there is no HG in TCGA. 
+
+Note that we can ask two totally separate questions: 
+
+- What is the result of the Thresher pipeline if applied to the GTEx data? For this we should only filter out HGs and then run the pipeline on the rest of the miRs that we have. The down the line if we want to compare the found clusters we can use a dictionary to cross reference the findings. 
+- What is the expression value of the closest gene to centriods? We want 51 numbers from these 56k measurements of GTEx to do the prediction. Hopefully we can match the name of them exactly, although the directionality may result in some issues. But we hope that it does not reduce the R2 that much. 
+
+In this series of report (series 7x-....Rmd), we only do the latter. The only issue here is how to normalize the mRNA and miRs so that we do not mess up the scale of the learned coefficient in the OLS from the TCGA. Since we do not want to redo everything for the TCGA, we fix that normalization and try to make GTEx as similar to it as possible. 
+
+For TCGA (In this notebook: 70-....Rmd) we:
+- Re-run the Thresher and this time save the medoid genes for miRs and mRNAs
+- Re-run the linear model this time with medoid and scale the data. Save the coefficients. 
+
+
+# Thresher + R2 Re-run with Medoids
+The point from samples which is closest to the centroid (mean) is exactly the medoid defined with Euclidean norm. Since I don't have the saved clusters I re-run the code. Codes mostly borrowed from TF and miR analysis. Since I already have the matched data, I use that instead of separate data files of miRs and TFs. This contains ~9k samples instead of ~11k which is good enough.
+
+## TFs
+First we need to determine which genes in the mRNA data are TFs. This has been done in another project and saved in "HumanTF.csv" file which we load here. A couple of them seems to be wrong for sure: "T", "AR", and NA. We are going to remove the NA and let the downstream intersection with available mRNA data take care of the rest.
+
+```{r load tfs, warning = FALSE}
+htf <- read.csv(file = file.path(paths$clean, "HumanTF.csv"))
+tfSymbols <- htf$Hs.SYMBOL
+tfSymbols <- tfSymbols[!is.na(tfSymbols)]
+# tfSymbols
+```
+
+Now we separate out TFs from the rest of mRNAs. First we check if we get the magic number 486 which we had before so that I be sure nothing is wrong. Then we will separate TFs:
+```{r tf separation, warning = FALSE}
+sum(tfSymbols %in% rownames(mRNAdata))
+tfdata <- mRNAdata[(rownames(mRNAdata) %in% tfSymbols), ]
+mRNARest <- mRNAdata[!(rownames(mRNAdata) %in% tfSymbols), ]
+dim(tfdata)
+dim(mRNARest)
+rm(mRNAdata)
+```
+### Threshing
+Finally, we run the Thresher:
+```{r tresh tfs, warning = FALSE}
+suppressMessages( library(Thresher) ) # brings along PCDimension automatically
+f <- file.path(paths$scratch, "threshTF.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  set.seed(47053)
+  
+  Thresh <- Thresher(t(tfdata), method="auer.gervini", 
+                     scale=TRUE, agfun=agDimTwiceMean)
+  Reap <- Reaper(Thresh, useLoadings=TRUE, cutoff = 0.35, metric=NULL, 
+                 linkage="ward.D2", maxSampleGroups = 486)
+
+  save(Thresh, Reap, file = f)
+}
+rm(f)
+```
+Let's look over the results.
+```{r peek}
+Thresh@pcdim  # Number of principal components
+Reap@pcdim    # Number of principal components
+Reap@bic      # Bayes Infomation Criterion
+Reap@nGroups  # Number of clusters
+```
+Getting to know the clusters:
+```{r sumfit}
+groups <- predict(Reap@fit)
+names(groups) <- rownames(tfdata)[Reap@keep]
+table(groups)
+NG <- Reap@nGroups
+for (I in 1:NG) {
+  cat("\nTF Cluster", I, ":\n", file=stdout())
+  print(names(groups)[groups == I])
+}
+
+tfclusNames <- factor(paste("TFC", groups, sep=""), levels=paste("TFC", 1:NG, sep=""))
+tfClusters <- data.frame(Cluster=tfclusNames, row.names = names(groups))
+table(tfClusters$Cluster)
+```
+
+We need to save the medoids: 
+```{r save tf mediods, warning = FALSE}
+
+f <- file.path(paths$scratch, "tfMedoid.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  tfMedoid <- matrix(0, ncol(tfdata), NG)
+  colnames(tfMedoid) <- 1:ncol(tfMedoid)
+  
+  for (I in 1:NG) {
+    clusterExp <- tfdata[names(groups)[groups == I],]
+    meanZeroClusterExp <- sweep(clusterExp, 2, apply(clusterExp, 2, mean))
+    distanceFromMean <- apply(meanZeroClusterExp, 1, function(x) {sqrt(sum(x*x))})
+    medoidGene <- rownames(clusterExp)[which.min(distanceFromMean)]
+    tfMedoid[, I] <- tfdata[medoidGene,]
+    colnames(tfMedoid)[I] <- medoidGene
+  }
+  save(tfMedoid, file = f)
+}
+rm(f)
+dim(tfMedoid)
+print(colnames(tfMedoid))
+# Clustertsne <- Rtsne(tfMedoid, initial_config = NULL, k = 2, initial_dims = 30, perplexity = 30,
+#          max_iter = 1000, min_cost = 0, epoch_callback = NULL, whiten = TRUE,
+#          epoch=100)
+# plot(Clustertsne$Y,  xlab="T1", ylab="T2", cex=0.8)
+```
+### R2
+First we compute mean and variance of each gene to be used in R2 computation:
+```{r fixed}
+f <- file.path(paths$scratch, "mRNARestConstants.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  N <- ncol(mRNARest)
+  dmean <- matrixMean(mRNARest)
+  dvar <- as.vector(matrixVar(mRNARest, dmean)) 
+  save(N, dvar, file = f)
+}
+```
+
+Next a plot function where accepts a threshold for R2 in case there are large negative values when we test them on GTEx: 
+```{r plotfnc}
+histsR2 <- function(residuals, saveName, lN, ldvr, thrsh = 0){
+  f <- file.path(paths$scratch, paste(saveName, ".Rda", sep = ""))
+  if (file.exists(f)) {
+    load(f)
+  } else {
+    ssres <- apply(residuals^2, 1, sum)
+    r2s <- 1 - ssres/(ldvr * (lN-1))
+    save(r2s, file=f)
+  }
+  print(paste("Percentage of R2 more than the threshold ", thrsh, " is ", sum(r2s >thrsh) /length(r2s), sep = ""))
+  par(mfrow=c(1,1))
+  hist(r2s[r2s>thrsh], breaks=234, main="R2") 
+  summary(r2s)
+} 
+```
+
+Next, we fit the linear models only to TFs:
+```{r tfMLM}
+library(ClassComparison)
+f <- file.path(paths$scratch, "tfMedoidMLM.Rda")
+g <- file.path(paths$scratch, "tfMedoidResiduals.Rda")
+if (file.exists(f)) {
+  load(f)
+  load(g)
+} else {
+  load(file.path(paths$scratch, "tfMedoid.Rda"))
+  tfMLM <- MultiLinearModel(Y ~ ., tfMedoid, mRNARest)
+  tfResiduals <- mRNARest - t(tfMLM@predictions)
+  save(tfMLM,  file = f)
+  save(tfResiduals, file = g)
+}
+rm(f, g)
+gc()
+
+saveAs <- "tfMedoidR2"
+histsR2(tfResiduals, saveAs, N, dvar)
+# plotNsave(saveAs, 'tfmedoid-only-r2.png', 'TF-only Model')
+```
+
+We clean up in a separate block:
+```{r , warning = FALSE}
+rm(tfMedoid, tfMLM, tfResiduals)
+gc()
+```
+
+## Threshing miRs
+Mirs are already loaded as a part of matched data and there is no need for pre-processing. We just remove miRs that are zero in many samples for future computational stability. 
+
+### Threshing
+We run the Thresher:
+```{r tresh mirs, warning=FALSE}
+dim(miRdata)
+nonzero <- apply(miRdata, 1, function(x) sum(x != 0))
+cutoff <- 0.1*ncol(miRdata)
+filteredMir <- miRdata[nonzero > cutoff,]
+dim(filteredMir)
+
+f <- file.path(paths$scratch, "threshMir.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  set.seed(47053)
+  Thresh <- Thresher(t(filteredMir), method="auer.gervini", 
+                     scale=TRUE, agfun=agDimTwiceMean)
+  Reap <- Reaper(Thresh, useLoadings=TRUE, cutoff = 0.35, metric=NULL, 
+                 linkage="ward.D2", maxSampleGroups = 486)
+  save(Thresh, Reap, file = f)
+}
+rm(f)
+```
+Let's look over the results.
+```{r peek mir}
+Thresh@pcdim  # Number of principal components
+Reap@pcdim    # Number of principal components
+Reap@bic      # Bayes Infomation Criterion
+Reap@nGroups  # Number of clusters
+```
+Getting to know the clusters:
+```{r sumfit mir}
+groups <- predict(Reap@fit)
+names(groups) <- rownames(filteredMir)[Reap@keep]
+table(groups)
+NG <- Reap@nGroups
+for (I in 1:NG) {
+  cat("\nMIR Cluster", I, ":\n", file=stdout())
+  print(names(groups)[groups == I])
+}
+
+mirclusNames <- factor(paste("MIR", groups, sep=""), levels=paste("MIR", 1:NG, sep=""))
+mirClusters <- data.frame(Cluster=mirclusNames, row.names = names(groups))
+table(mirClusters$Cluster)
+```
+
+We need to save the mediods but this time we save both closest and second closest miRs to the center of each cluster. This is because for GTEx I could not match all of the miR medoids, so I use the second closest instead in those cases:
+```{r save mir mediods, warning = FALSE}
+miRMedoid <- matrix(0, ncol(filteredMir), NG)
+miRMedoid2 <- matrix(0, ncol(filteredMir), NG)
+
+colnames(miRMedoid2) <- colnames(miRMedoid) <- 1:ncol(miRMedoid)
+
+f <- file.path(paths$scratch, "miRMedoid.Rda")
+g <- file.path(paths$scratch, "miRMedoid2.Rda")
+
+if (file.exists(f)) {
+  load(f)
+  load(g)
+} else {
+  for (I in 1:NG) {
+    clusterExp <- filteredMir[names(groups)[groups == I],]
+    meanZeroClusterExp <- sweep(clusterExp, 2, apply(clusterExp, 2, mean))
+    dFromMean <- apply(meanZeroClusterExp, 1, function(x) {sqrt(sum(x*x))})
+    mediodGenes <- names(dFromMean)[order(dFromMean)]
+    miRMedoid[, I] <- filteredMir[mediodGenes[1],]
+    colnames(miRMedoid)[I] <- mediodGenes[1]
+    miRMedoid2[, I] <- filteredMir[mediodGenes[2],]
+    colnames(miRMedoid2)[I] <- mediodGenes[2]
+  }
+  save(miRMedoid, file = f)
+  save(miRMedoid2, file = g)
+}
+dim(miRMedoid)
+print(colnames(miRMedoid))
+
+dim(miRMedoid2)
+print(colnames(miRMedoid2))
+```
+### R2
+
+Next, we fit the linear models only to miRs:
+```{r mirMLM}
+library(ClassComparison)
+
+f <- file.path(paths$scratch, "miRMedoidMLM.Rda")
+g <- file.path(paths$scratch, "miRMedoidResiduals.Rda")
+if (file.exists(f)) {
+  load(f)
+  load(g)
+} else {
+  mirMLM <- MultiLinearModel(Y ~ ., miRMedoid, mRNARest)
+  mirResiduals <- mRNARest - t(mirMLM@predictions)
+  save(mirMLM,  file = f)
+  save(mirResiduals, file = g)
+}
+rm(f, g)
+gc()
+
+saveAs <- "miRMedoidR2"
+histsR2(mirResiduals, saveAs, N, dvar)
+```
+
+We clean up in a separate block:
+```{r , warning = FALSE}
+rm(miRMedoid, miRMedoid2, mirMLM, mirResiduals)
+gc()
+```
+
+
+## R2 Joint Models
+
+### Simple Joint = (TF, miR) Model
+
+```{r jointMLM}
+library(ClassComparison)
+
+f <- file.path(paths$scratch, "jointMedoidMLM.Rda")
+g <- file.path(paths$scratch, "jointMedoidResiduals.Rda")
+if (file.exists(f)) {
+  load(f)
+  load(g)
+} else {
+  load(file.path(paths$scratch, "tfMedoid.Rda"))
+  load(file.path(paths$scratch, "miRMedoid.Rda"))
+  jointMLM <- MultiLinearModel(Y ~ ., cbind(tfMedoid, miRMedoid), mRNARest)
+  jointResiduals <- mRNARest - t(jointMLM@predictions)
+  save(jointMLM,  file = f)
+  save(jointResiduals, file = g)
+}
+rm(f, g)
+gc()
+
+saveAs <- "jointMedoidR2"
+histsR2(jointResiduals, saveAs, N, dvar)
+```
+
+
+We clean up in a separate block: 
+```{r , warning = FALSE}
+rm(tfMedoid, miRMedoid, jointMLM, jointResiduals)
+gc() 
+```
+
+
+### Per-Tissue Joint = (TF, miR) Model
+An intelligent way of bringing in the tissue in the predition is to have a separate predictors per tissue. We first mean zero the output (using all genes) and then fit a per tissue model (fit the the remaining residuals). First let initialize:
+```{r init, warning = FALSE}
+library(ClassComparison)
+magicThresh <- 60  #We have 58 features, so at least we need 58 samples.
+f <- file.path(paths$scratch, "mean0mRNA.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  mean0mRNA <- sweep(mRNARest, 1, apply(mRNARest, 1, mean))
+  save(mean0mRNA,  file = f)
+}
+rm(f)
+tissueResiduals <- matrix(0, nrow = nrow(mean0mRNA), ncol = ncol(mean0mRNA))
+```
+
+Now, fit one linear model per tissue. For low sample tissues, the model is just an intercept. Some features are constants for some tissues, we remove them to avoid singularity:
+```{r tissueMLM}
+f <- file.path(paths$scratch, "jointPerTissueMedoidMLM.Rda")
+g <- file.path(paths$scratch, "jointPerTissueMedoidResiduals.Rda")
+if (file.exists(f)) {
+  load(f)
+  load(g)
+} else {
+  load(file.path(paths$scratch, "tfMedoid.Rda"))
+  load(file.path(paths$scratch, "miRMedoid.Rda"))
+  tissueMLMList <- list()
+  lowSampleTissue <- c() #what type has insufficient sample for MLM
+  X <- cbind(tfMedoid, miRMedoid)
+  nonDegenFperTissue <- matrix(T, length(levels(cancerType)), ncol(X))
+  rownames(nonDegenFperTissue) <- as.character(levels(cancerType))
+  
+  for(type in levels(cancerType)){
+    print(paste("Fitting", as.character(type)))
+    Ts <- (cancerType == type) #Tissue Selector
+    if(sum(Ts) < magicThresh){ #Per-tissue average is our predictor   
+      meanTissuemRNA <- apply(mean0mRNA[,Ts], 1, mean)
+      tissueResiduals[,Ts] <- mean0mRNA[,Ts] - meanTissuemRNA
+      tissueMLMList[[as.character(type)]] <- meanTissuemRNA #just an intercept
+      lowSampleTissue <- c(lowSampleTissue, TRUE) 
+    } else{
+      newX <- X[Ts,]
+      #Remove constant features to avoid singularity
+      nonDegenF <- apply(newX, 2, min) != apply(newX, 2, max) #none degenerate features
+      nonDegenFperTissue[as.character(type),] <- nonDegenF
+      newX <- newX[, nonDegenF]
+      tissueMLM <- MultiLinearModel(Y ~ ., newX, mean0mRNA[,Ts])
+      tissueResiduals[,Ts] <- mean0mRNA[,Ts] - t(tissueMLM@predictions)
+      tissueMLMList[[as.character(type)]] <- tissueMLM
+      lowSampleTissue <- c(lowSampleTissue, FALSE) 
+    }
+    
+  }
+  save(tissueMLMList,  file = f)
+  save(tissueResiduals, file = g)
+}
+rm(f, g)
+gc()
+
+saveAs <- "tissueMedoidR2"
+histsR2(tissueResiduals, saveAs, N, dvar)
+```
+
+
+We clean up in a separate block but we do not remove the tissueMLM to use it later. 
+```{r , warning = FALSE}
+rm(tfMedoid, miRMedoid, tissueMLMList, tissueResiduals, mean0mRNA)
+gc()
+```
+
+
+
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+```
+
+

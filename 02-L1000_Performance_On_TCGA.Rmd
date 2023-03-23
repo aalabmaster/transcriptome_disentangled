@@ -1,0 +1,196 @@
+
+---
+title: "Implementing L1000 Performance Measure"
+author: "Amir Asiaee"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+```{r globopt, echo=FALSE}
+```
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+# Getting Started
+The goal of this report is to test the predictive performance of the L1000 genes on the TCGA dataset. 
+First, we load some global information about where to find data folders. 
+```{r globals}
+rm(list=ls())
+source("00-paths.R")
+ls()
+```
+
+Next, we need to load their predictor genes. The data is coming from the supplementary material of the [paper](https://www.cell.com/cell/fulltext/S0092-8674(17)31309-0) Table S2 L1000 Probes. Out of ~1000 genes 27 of them are not matched for in the TCGA data:
+```{r loadingL1000, warning = FALSE}
+l1k <- read.csv(file.path(paths$raw, "l1000.csv"))
+l1k <- l1k[2:nrow(l1k),]
+
+load(file.path(paths$scratch, "allMrnaNames.Rda"))
+length(l1k$Gene.Symbol) - sum(l1k$Gene.Symbol %in% namesMrnaAll)
+```
+
+Next, we load the TCGA data. Note that there is no further/separate normalization involved, we have the names for the predictors and outcomes. 
+```{r , warning = FALSE}
+load(file = file.path(paths$clean, "matchedData.Rda"))
+dim(mRNAdata)
+X <- mRNAdata[rownames(mRNAdata) %in% l1k$Gene.Symbol, ]
+dim(X)
+Y <- mRNAdata[!(rownames(mRNAdata) %in% l1k$Gene.Symbol), ]
+dim(Y)
+```
+
+# Checking their R2 performance
+
+Now the question is can our humble computer does the prediction (previously we could do it using 56 predictors but now the matrices are much bigger with 1000 predictors). Trying it out: 
+
+```{r , warning = FALSE, echo=F}
+library(oompaBase)
+
+histsR2 <- function(residuals, saveName, lN, ldvr, thrsh = 0){
+  f <- file.path(paths$scratch, paste(saveName, ".Rda", sep = ""))
+  if (file.exists(f)) {
+    load(f)
+  } else {
+    ssres <- apply(residuals^2, 1, sum)
+    r2s <- 1 - ssres/(ldvr * (lN-1))
+    save(r2s, file=f)
+  }
+  # print(paste("Percentage of R2 more than the threshold ", thrsh, " is ", sum(r2s >thrsh) /length(r2s), sep = ""))
+  par(mfrow=c(1,1))
+  hist(r2s[r2s>thrsh], breaks=234, main="R2") 
+  print(summary(r2s))
+} 
+
+f <- file.path(paths$scratch, "YConstants.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  N <- ncol(Y)
+  dmean <- matrixMean(Y)
+  dvar <- as.vector(matrixVar(Y, dmean)) 
+  save(N, dvar, file = f)
+}
+
+```
+
+```{r jointMLM}
+library(ClassComparison)
+
+f <- file.path(paths$scratch, "l1000MLM.Rda")
+g <- file.path(paths$scratch, "l1000Residuals.Rda")
+if (file.exists(f)) {
+  load(f)
+  load(g)
+} else {
+  l1000MLM <- MultiLinearModel(Y ~ ., t(X), Y)
+  l1000Residuals <- Y - t(l1000MLM@predictions)
+  save(l1000MLM,  file = f)
+  save(l1000Residuals, file = g)
+}
+rm(f, g)
+gc()
+
+saveAs <- "l1000R2"
+histsR2(l1000Residuals, saveAs, N, dvar)
+# plotNsave(saveAs, 'jointMedoid-only-r2.png', 'Joint=(TF, miR) Model')
+```
+
+```{r beutiful, warning = FALSE}
+library(ggplot2)
+load(file.path(paths$scratch, 'l1000R2.Rda'))
+ 
+theme_set(theme_minimal() + 
+            theme(axis.line = element_line(colour = "black"),
+                  panel.grid.major = element_blank(),
+                  panel.grid.minor = element_blank(),
+                  panel.border = element_blank(),
+                  panel.background = element_blank(),
+                  title = element_text(size = 16)))
+
+p0 <- NULL
+  x <- seq(0, 1, len = length(r2s))
+  p0 <- ggplot(as.data.frame(r2s), aes(r2s)) +
+    geom_histogram(
+      aes(y = ..density..),
+      color = "black",
+      fill = "white",
+      binwidth = .01
+    ) +
+    xlab(expression(R ^ 2)) + ylab('Density') + ggtitle('Transcriptome Prediction with L1000 Landmark Genes\n\u200B') + xlim(c(0, 1))
+print(p0)
+```
+
+# Checking their correlation performance 
+
+It seems that they are doing a really good job with 10k genes! We can test their correlation performance too: 
+
+```{r corrPerf, warning = FALSE}
+f <- file.path(paths$scratch, "corl1000.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  load(file.path(paths$scratch, "l1000MLM.Rda"))
+  Yhat <- t(l1000MLM@predictions)
+  C <- cor(t(Y), t(Yhat))
+  save(C, file = f)
+}
+dim(C)
+```
+
+
+```{r separate , warning = FALSE}
+f <- file.path(paths$scratch, "l1000Cor.Rda")
+g <- file.path(paths$scratch, "nullL1000Cor.Rda")
+if (file.exists(f)) {
+  load(f)
+  load(g)
+} else {
+  Ours <- diag(C)
+  Null <- C[row(C) != col(C) & row(C) > col(C)]
+  save(Ours, file = f)
+  save(Null, file = g)
+}
+```
+
+Plotting:
+```{r , warning = FALSE}
+hist(Ours, breaks = 123)                    
+hist(Null, breaks = 123)             
+```
+Check the performance against the null:
+
+```{r , warning = FALSE}
+z <- quantile(Null, .95, na.rm = T)
+z
+print(paste("Our performance", sum(Ours > z, na.rm = T) / length(Ours)))
+```
+
+
+
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+
+```
+
+
+
