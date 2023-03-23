@@ -2,7 +2,7 @@
 - To read the report: just download the html files. 
 
 - To run the code: 
-    1. Download the data directory from: 
+    1. Download the data directory from  [here](https://drive.google.com/drive/folders/1CtrYdeCHIckUfppE06nndzxa8RDf2d3F?usp=sharing)
         - You only need files in the `clean` and `raw` directory but saving files in the `scratch` directory will save you computation. 
     2. Put the data folder wherever you want. 
     3. Put the `transcriptome_disentangled.json` in your home directory inside a `Paths` folder. 
