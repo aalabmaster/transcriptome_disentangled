@@ -1,0 +1,344 @@
+---
+title: "Predicting the Whole Transcriptome"
+author: "Amir Asiaee"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+```{r globopt}
+knitr:::opts_chunk$set(fig.path="../results/mirfigs/")
+knitr::opts_chunk$set(fig.width=12) 
+```
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+# Getting Started
+Here, we continue to show that our selected features (TFs and miRs) are bilogically informative. We show that we can explain the variation of the whole transcriptome using only 47 measurements!
+
+```{r globals}
+rm(list=ls())
+source("00-paths.R")
+
+load(file.path(paths$clean, 'xena-tcga.Rda'))
+load(file.path(paths$scratch, "xena-tcga-mir-medoid.Rda"))
+load(file.path(paths$scratch, "xena-tcga-tf-medoid.Rda"))
+mRNARest <- as.matrix(tcga$mrna)
+# Removing constant genes to prevent Inf R^2
+mRNAs_sd <- apply(mRNARest, 1, sd)
+mRNARest <- mRNARest[mRNAs_sd != 0, ]
+
+cancerType <- tcga$tissue
+
+dim(mirMedoid)
+dim(tfMedoid)
+dim(mRNARest)
+
+dev_mode <- T
+
+rm(tcga, mRNAs_sd)
+```
+
+# R2 Joint Models
+By joint model, we mean a model that uses both TFs and miRNAs 
+```{r , warning = FALSE}
+compute_and_save_outcome_variation <- function(f, outcome) {
+  requireNamespace("ClassComparison", quietly = TRUE)  
+  if (file.exists(f)) {
+    load(f)
+  } else {
+    N <- ncol(outcome)
+    dmean <- matrixMean(outcome)
+    dvar <- as.vector(matrixVar(outcome, dmean))
+    save(N, dvar, file = f)
+  }
+  return(list(N = N, dvar = dvar))
+}
+
+f <- file.path(paths$scratch, "xena-tcga-mRNA-outcome-constants.Rda")
+constants <- compute_and_save_outcome_variation(f, mRNARest)
+
+rm(f, const_genes, dmean, i, myZero, results)
+```
+
+```{r hist plot, warning = FALSE, echo=FALSE}
+histsR2 <- function(residuals, saveName, constants, replace = F, thrsh = 0){
+  f <- file.path(paths$scratch, paste(saveName, ".Rda", sep = ""))
+  if (file.exists(f) && !replace) {
+    load(f)
+  } else {
+    ssres <- apply(residuals^2, 1, sum)
+    r2s <- 1 - ssres/(constants$dvar * (constants$N-1))
+    save(r2s, file=f)
+  }
+  print(paste("Percentage of R2 more than the threshold ", thrsh, " is ", sum(r2s >thrsh) /length(r2s), sep = ""))
+  par(mfrow=c(1,1))
+  hist(r2s[r2s>thrsh], breaks=234, main="R2") 
+  summary(r2s)
+  return(r2s)
+}
+
+```
+
+## Tissue-Agnostic Model
+
+Here we regress each (of ~20,000) mRNA into miR and TF mediods. So we have 20,000 regression problems, 10,000 samples, and 47 features. 
+
+```{r }
+library(ClassComparison)
+
+compute_agnostic_model <- function(f_path, g_path, X1, X2, Y, saveAs) {
+  if (file.exists(f_path) && file.exists(g_path)) {
+    load(f_path)
+    load(g_path)
+  } else {
+    requireNamespace("ClassComparison", quietly = TRUE)  
+    agnostic_mlm <- MultiLinearModel(Y ~ ., cbind(X1, X2), Y) #It has intercept internally
+    agnostic_R <- Y - t(agnostic_mlm@predictions)
+    save(agnostic_R, agnostic_mlm, file = g_path)
+  }
+  return(list(R = agnostic_R, mlm = agnostic_mlm))
+}
+
+
+f <- file.path(paths$scratch, "xena-tcga-agnostic-mlm.Rda")
+g <- file.path(paths$scratch, "xena-tcga-agnostic-residuals.Rda")
+agnostic <- compute_agnostic_model(f, g, tfMedoid, mirMedoid, mRNARest)
+saveAs <- "xena-tcga-agnostic-R2"
+agnostic_r2s <- histsR2(agnostic$R, saveAs, constants, replace = dev_mode)
+```
+
+We clean up in a separate block: 
+```{r , warning = FALSE}
+rm(agnostic, r2s, saveAs, ssres, f, g)
+gc() 
+```
+
+
+## Tissue-Aware Model
+An intelligent way of bringing in the tissue into the prediction is to have a separate prediction per tissue. We first mean zero the output (using all genes) and then fit a per tissue model (fit the the residuals). This is equivalent to fit a global linear model first and then fit the residuals with a linear model per tissue.
+
+First let initialize:
+```{r , warning = FALSE}
+magicThresh <- 50  #We have 47 features, so at least we need 50 samples.
+f <- file.path(paths$scratch, "xena-tcga-mean0mRNA.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  mean0mRNA <- sweep(mRNARest, 1, apply(mRNARest, 1, mean))
+  save(mean0mRNA,  file = f)
+}
+rm(f)
+```
+
+Now, fit one linear model per tissue. For low sample tissues, the model is just an intercept. Some features are constants for some tissues, we remove them to avoid singularity:
+```{r }
+library(ClassComparison)
+aware_residuals <- matrix(0, nrow = nrow(mean0mRNA), ncol = ncol(mean0mRNA))
+f <- file.path(paths$scratch, "xena-tcga-tissue-aware-mlm.Rda")
+g <- file.path(paths$scratch, "xena-tcga-tissue-aware-residuals.Rda")
+
+if (file.exists(f)) {
+  load(f)
+  load(g)
+} else {
+  
+  aware_mlm_list <- list()
+  low_sample_tissue <- c() #what type has insufficient sample for MLM
+  X <- cbind(tfMedoid, mirMedoid)
+  variable_features_in_tissue <- matrix(T, length(unique(cancerType)), ncol(X))
+  rownames(variable_features_in_tissue) <- unique(cancerType)
+  
+  for(type in unique(cancerType)){
+    print(paste("Fitting", type))
+    Ts <- (cancerType == type) #Tissue Selector
+    if(sum(Ts) < magicThresh){ #Per-tissue average is our predictor   
+      tissue_mrna_mean <- apply(mean0mRNA[,Ts], 1, mean)
+      aware_residuals[,Ts] <- mean0mRNA[,Ts] - tissue_mrna_mean
+      aware_mlm_list[[type]] <- tissue_mrna_mean #just an intercept
+      low_sample_tissue <- c(low_sample_tissue, TRUE) 
+    } else{
+      newX <- X[Ts,]
+      #Remove constant features to avoid singularity
+      variable_features <- apply(newX, 2, min) != apply(newX, 2, max) #none degenerate (non-constant) features
+      variable_features_in_tissue[type,] <- variable_features
+      newX <- newX[, variable_features]
+      aware_mlm <- MultiLinearModel(Y ~ ., newX, mean0mRNA[,Ts])
+      aware_residuals[,Ts] <- mean0mRNA[,Ts] - t(aware_mlm@predictions)
+      aware_mlm_list[[as.character(type)]] <- aware_mlm
+      low_sample_tissue <- c(low_sample_tissue, FALSE) 
+    }
+    
+  }
+  # Checking low sample tissues:
+  print(paste("Low sample cancer types", unique(cancerType)[low_sample_tissue]))
+  # Sanity check
+  table(cancerType)
+  
+  print(paste("Do we have any constant feature per tissue?", 
+              ifelse(sum(apply(variable_features_in_tissue, 1, sum) != ncol(tfMedoid) + ncol(mirMedoid)) > 0, "Yes", "No")))
+  
+  save(aware_mlm_list,  file = f)
+  save(aware_residuals, file = g)
+}
+rm(f, g)
+gc()
+
+saveAs <- "xena-tcga-aware-R2"
+aware_r2s <- histsR2(aware_residuals, saveAs, constants, replace = dev_mode)
+```
+
+We clean up in a separate block. 
+```{r , warning = FALSE}
+rm(tfMedoid, mirMedoid, aware_mlm_list, aware_residuals, mean0mRNA, magicThresh, 
+   variable_features, variable_features_in_tissue, low_sample_tissue, 
+   dvar, newX, type, Ts, saveAs, X, tissue_mrna_mean, aware_mlm, cohorts, 
+   mRNARest, N, cancerType, tcga)
+gc()
+```
+
+
+# BetaMixture Model
+
+
+```{r bestk, warning = FALSE, , echo=FALSE}
+library(BetaModels)
+
+allR2 <- data.frame(agnostic = agnostic_r2s, aware = aware_r2s)
+
+#Fitting the best K once with more precision:
+library(fitdistrplus)
+bestK <- c(2, 2) #manually entered 
+bestBetaParameters <- bestBetaModels <- list()
+
+
+bestModelsFileName <- file.path(paths$scratch, 'bestBetaModels-final-ag-aw-tpm.Rda')
+bestParamsFileName <- file.path(paths$scratch, 'bestBetaParams-final-ag-aw-tpm.Rda')
+if (!file.exists(bestParamsFileName)) {
+  for (i in 1:ncol(allR2)) {
+    expR2 <- colnames(allR2)[i]
+    tempData <- allR2[, expR2]
+    tempData[tempData < 1E-10] <- 1E-10
+    tempData[tempData > 1 - 1E-10] <- 1 - 1E-10
+    myK <- bestK[i]
+    
+    if (myK == 1) {
+      output <- fitdist(tempData, "beta", "mle")
+      params <- matrix(c(1, output$estimate), ncol = 1)
+    } else {
+      output <-
+        BetaMixture(tempData,
+                    K = myK,
+                    forever = 100,
+                    epsilon = 0.001)
+      params <- rbind(output@phi, output@mle)
+    }
+    bestBetaModels[[expR2]] <- output
+    rownames(params) <- c("pi", "alpha", "beta")
+    bestBetaParameters[[expR2]] <- params
+  }
+  save(bestBetaParameters, file = bestParamsFileName)
+  save(bestBetaModels, file = bestModelsFileName)
+  
+} else {
+  load(bestParamsFileName)
+  load(bestModelsFileName)
+}
+```
+
+```{r , warning = FALSE, echo=FALSE}
+
+library(ggplot2)
+library(Polychrome)
+myColors <- light.colors(5)
+titles <-
+  c("Transcriptome Prediction with 47 Regulatory Elements:\nTissue-Agnostic Model", "Transcriptome Prediction with 47 Regulatory Elements:\nTissue-Aware Model")
+modAllData <- allR2;
+mixtureAllDataFileName <- file.path(paths$scratch, 'mixtureAllData-ag-aw-tpm.Rda')
+
+
+for (i in 1:ncol(allR2)) {
+  label <- c('poor', 'well')
+  expR2 <- colnames(allR2)[i]
+  params <- bestBetaParameters[[expR2]]
+  expTitle <- titles[i]
+  tempData <- allR2[, expR2]
+  tempData[tempData < 1E-10] <- 1E-10
+  tempData[tempData > 1 - 1E-10] <- 1 - 1E-10
+  
+  if (bestK[i] > 1) {
+    #for the first three models
+    model <- bestBetaModels[[expR2]]
+    tMember <- apply(model@Z, 1, which.max)
+    low <- tempData < .5
+    # swap poor/well labels
+    poorComp <- paste(expR2, '.', 'poor', sep = "")
+    wellComp <- paste(expR2, '.', 'well', sep = "")
+    
+    modAllData <- cbind(modAllData,  as.data.frame(matrix(rep(NA, 2*length(model@datavec)), ncol=2)))
+    colnames(modAllData)[(ncol(modAllData) - 1):ncol(modAllData)] <- c(poorComp, wellComp)
+    if (mean(tempData[tMember == 1]) > mean(tempData[tMember == 2])) {
+      modAllData[[wellComp]][tMember == 1] <- tempData[tMember == 1 | !low]
+      modAllData[[poorComp]][tMember == 2] <- tempData[tMember == 2 & low]
+    } else {
+      modAllData[[wellComp]][tMember == 2] <- tempData[tMember == 2 | !low]
+      modAllData[[poorComp]][tMember == 1] <- tempData[tMember == 1 & low]
+    }
+  }
+  
+  p0 <- NULL
+  x <- seq(0, 1, len = length(tempData))
+  p0 <- ggplot(as.data.frame(tempData), aes(tempData)) +
+    geom_histogram(
+      aes(y = ..density..),
+      color = "black",
+      fill = "white",
+      binwidth = .01
+    ) +
+    xlab(expression(R ^ 2)) + ylab('Density') + ggtitle(expTitle) + xlim(c(0, 1))
+  for (j in 1:ncol(params)) {
+    p0 <- p0 + stat_function(
+      aes(x = x),
+      fun = function(x, j)
+      {
+        params[1, j] * dbeta(x, shape1 = params[2, j], shape2 = params[3, j])
+      },
+      colour = myColors[j],
+      n = 1000,
+      size = 1.5,
+      args = list(j = j)
+    )
+  }
+  print(p0)  
+}
+
+save(modAllData, file = mixtureAllDataFileName)
+
+```
+
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+```
+
+
+
+

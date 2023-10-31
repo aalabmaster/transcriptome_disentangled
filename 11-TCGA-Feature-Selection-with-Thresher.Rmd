@@ -1,0 +1,194 @@
+---
+title: "Selecting TFs and Mirs from Xena's TCGA Data"
+author: "Amir Asiaee"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+```{r globopt}
+knitr:::opts_chunk$set(fig.path="../results/mirfigs/")
+knitr::opts_chunk$set(fig.width=12) 
+```
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+# Getting Started
+
+We run our feature selection pipeline (Thresehr and Reaper) on TCGA's miR and TF data onces for TCGA R^2 analysis. 
+
+```{r globals}
+rm(list=ls())
+source("00-paths.R")
+
+load(file.path(paths$clean, 'xena-tcga.Rda'))
+dim(tcga$tf)
+dim(tcga$mir)
+```
+
+# Thresher for MicroRNA
+First, we investigate the number of zeros before aggregation of miRs and remove microRNAs that are zero in 80 percent of samples:
+
+```{r , warning = FALSE}
+# Getting a logical matrix indicating whether the value is 0
+zero_logical_matrix <- tcga$mir == 0
+
+# Calculating the percentage of zeros for each microRNA
+zero_percentages <- rowMeans(zero_logical_matrix) * 100
+
+nrow(tcga$mir) - sum(zero_percentages > 80)
+
+selected_mirs <- tcga$mir[zero_percentages < 80, ]
+dim(selected_mirs)
+
+rm(zero_logical_matrix, zero_percentages)
+```
+
+Let's run Thresher on selected Mirs from TCGA:
+
+```{r, warning = FALSE}
+suppressMessages( library(Thresher) ) # brings along PCDimension automatically
+f <- file.path(paths$scratch, "xena-tcga-thresh-mir.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  set.seed(47053)
+  Thresh <- Thresher(t(selected_mirs), method="auer.gervini", 
+                     scale=TRUE, agfun=agDimTwiceMean)
+  Reap <- Reaper(Thresh, useLoadings=TRUE, cutoff = 0.35, metric=NULL, 
+                 linkage="ward.D2", maxSampleGroups = 486)
+  
+  save(Thresh, Reap, file = f)
+}
+
+Thresh@pcdim  # Number of principal components
+Reap@nGroups  # Number of clusters
+
+groups <- predict(Reap@fit)
+names(groups) <- rownames(selected_mirs)[Reap@keep]
+table(groups)
+NG <- Reap@nGroups
+  
+rm(f, Thresh, Reap)
+```
+
+## Select the Mir Medoids
+We need to save the medoids: 
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, "xena-tcga-mir-medoid.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  mirMedoid <- matrix(0, nrow=ncol(selected_mirs), ncol=NG)
+  mirMedoidNames <- c()
+  
+  for (I in 1:NG) {
+    clusterExp <- selected_mirs[names(groups)[groups == I],]
+    meanZeroClusterExp <- sweep(clusterExp, 2, apply(clusterExp, 2, mean))
+    distanceFromMean <- apply(meanZeroClusterExp, 1, function(x) {sqrt(sum(x*x))})
+    medoidGene <- rownames(clusterExp)[which.min(distanceFromMean)]
+    mirMedoid[, I] <- as.numeric(selected_mirs[medoidGene, ])
+    mirMedoidNames <- c(mirMedoidNames, medoidGene)
+  }
+  colnames(mirMedoid) <- mirMedoidNames
+  rownames(mirMedoid) <- colnames(selected_mirs)
+  save(mirMedoid, file = f)
+}
+
+dim(mirMedoid)
+print(colnames(mirMedoid))
+
+rm(f, clusterExp, meanZeroClusterExp, distanceFromMean, medoidGene, 
+   selected_mirs, mirMedoidNames, I, NG, groups)
+```
+
+# Thresher for TFs
+
+Let's run Thresher on 478 TFs from TCGA:
+
+```{r , warning = FALSE}
+suppressMessages( library(Thresher) ) # brings along PCDimension automatically
+f <- file.path(paths$scratch, "xena-tcga-thresh-tf.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  set.seed(47053)
+  
+  Thresh <- Thresher(t(tcga$tf), method="auer.gervini", 
+                     scale=TRUE, agfun=agDimTwiceMean)
+  Reap <- Reaper(Thresh, useLoadings=TRUE, cutoff = 0.35, metric=NULL, 
+                 linkage="ward.D2", maxSampleGroups = 486)
+  
+  save(Thresh, Reap, file = f)
+}
+
+Thresh@pcdim  # Number of principal components
+Reap@nGroups  # Number of clusters
+
+groups <- predict(Reap@fit)
+names(groups) <- rownames(tcga$tf)[Reap@keep]
+table(groups)
+NG <- Reap@nGroups
+  
+rm(f, Thresh, Reap)
+```
+
+## Select the TF Medoids
+We need to save the medoids: 
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, "xena-tcga-tf-medoid.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  tfMedoid <- matrix(0, ncol(tcga$tf), NG)
+  tfMedoidNames <- c()
+  
+  for (I in 1:NG) {
+    clusterExp <- tcga$tf[names(groups)[groups == I],]
+    meanZeroClusterExp <- sweep(clusterExp, 2, apply(clusterExp, 2, mean))
+    distanceFromMean <- apply(meanZeroClusterExp, 1, function(x) {sqrt(sum(x*x))})
+    medoidGene <- rownames(clusterExp)[which.min(distanceFromMean)]
+    tfMedoid[, I] <- as.numeric(tcga$tf[medoidGene,])
+    tfMedoidNames <- c(tfMedoidNames, medoidGene)
+  }
+  colnames(tfMedoid) <- tfMedoidNames
+  rownames(tfMedoid) <- colnames(tcga$tf)
+  
+  save(tfMedoid, file = f)
+}
+
+dim(tfMedoid)
+print(colnames(tfMedoid))
+
+rm(f, clusterExp, meanZeroClusterExp, distanceFromMean, medoidGene, 
+   tfMedoidNames, I, NG, groups)
+```
+
+
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+
+```
+
+
+
+

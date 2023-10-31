@@ -1,0 +1,516 @@
+---
+title: "Generalizability of Transcriptome Prediction - FPKM Normalized TCGA Data"
+author: "Amir Asiaee"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+```{r globopt, echo=FALSE}
+knitr::opts_chunk$set(fig.width=12) 
+```
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+# Getting Started
+```{r globals}
+rm(list=ls())
+source("00-paths.R")
+ls()
+```
+
+Load both mRNA and miR data:
+```{r loadData, warning = FALSE}
+f <- file.path(paths$clean, "noGBMmatchedData.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  load(file = file.path(paths$clean, "matchedData.Rda"))
+  discard <- which(cancerType == 'GBM')
+  mRNAdata <- mRNAdata[, -discard]
+  miRdata <- miRdata[, -discard]
+  save(mRNAdata, miRdata, file = f)
+}
+dim(mRNAdata)
+dim(miRdata)
+rm(discard, f)
+gc()
+```
+
+Separate TF from mRNAs that we want to predict:
+```{r load tfs, warning = FALSE}
+f <- file.path(paths$scratch, 'tfdata.Rda')
+g <- file.path(paths$scratch, 'mrnaRestdata.Rda')
+if (file.exists(f)) {
+  load(f)
+  load(g)
+} else {
+  htf <- read.csv(file = file.path(paths$raw, "HumanTF.csv"))
+  tfSymbols <- htf$Hs.SYMBOL
+  tfSymbols <- tfSymbols[!is.na(tfSymbols)]
+  sum(tfSymbols %in% rownames(mRNAdata))
+  tfdata <- mRNAdata[(rownames(mRNAdata) %in% tfSymbols), ]
+  mRNARest <- mRNAdata[!(rownames(mRNAdata) %in% tfSymbols), ]
+  save(tfdata, file = f)
+  save(mRNARest, file = g)
+}
+dim(tfdata)
+dim(mRNARest)
+
+rm(mRNAdata, f, g, tfSymbols, sampleType, htf)
+gc()
+```
+# Cross-Validation for Model Complexity Selection
+
+## Saving Train and Test Batches for Cross Validation
+Adding fold variable to each sample and saving train/test portions for the whole analysis: 
+```{r fold, warning = FALSE}
+f <- file.path(paths$scratch, paste('train_batch_fpkm_', 1, '.Rda', sep = ''))
+nfolds <- 5
+if (!file.exists(f)) {
+  foldsId <- rep(1:nfolds, length.out = ncol(mRNARest))
+  for (k in 1:nfolds) {
+    print(paste("Fold", k, "started."))
+    index <- which(foldsId == k)
+    f <- file.path(paths$scratch, paste('train_batch_fpkm_', k, '.Rda', sep = ''))
+    g <- file.path(paths$scratch, paste('test_batch_fpkm_', k, '.Rda', sep = ''))
+  
+  
+    tfTrain <- tfdata[,-index]; tfTest <- tfdata[,index];
+    mirTrain <- miRdata[,-index]; mirTest <- miRdata[,index];
+    mrnaTrain <- mRNARest[,-index]; mrnaTest <- mRNARest[,index];
+    
+    save(tfTrain, mirTrain, mrnaTrain, file = f)
+    save(tfTest, mirTest, mrnaTest, file = g)
+  }
+}
+rm(mRNARest, miRdata, tfdata)
+rm(mirTest, mirTrain, mrnaTest, mrnaTrain, tfTest, tfTrain, foldsId, f, g, index, k)
+gc()
+```
+
+## Variable Selection with Thresher
+Variable selection:
+```{r tresh tfs, warning = FALSE}
+suppressMessages( library(Thresher) ) # brings along PCDimension automatically
+
+f <- file.path(paths$scratch, paste('thresh_reap_miR_fpkm_', 5, '.Rda', sep = ''))
+
+if (!file.exists(f)) {
+  set.seed(47053)
+  for (k in 1:nfolds) {
+    print(paste("Fold", k, "threshing started."))
+    load(file.path(paths$scratch, paste('train_batch_fpkm_', k, '.Rda', sep = '')))
+    rm(mrnaTrain)
+    
+    print(paste("Thresher for TFs"))
+    startTime <- Sys.time()
+    Thresh <- Thresher(t(tfTrain), method = "auer.gervini",
+                       scale = TRUE, agfun = agDimTwiceMean)
+    Reap <- Reaper(Thresh, useLoadings = TRUE, cutoff = 0.35, 
+                   metric = NULL, linkage = "ward.D2", maxSampleGroups = 486)
+    f <- file.path(paths$scratch, paste('thresh_reap_tf_fpkm_', k, '.Rda', sep = ''))
+    save(Thresh, Reap, file = f)
+    print(Sys.time() - startTime)
+    
+    print(paste("Thresher for miRs"))
+    startTime <- Sys.time()
+    nonzero <- apply(mirTrain, 1, function(x) sum(x != 0))
+    cutoff <- 0.25 * ncol(mirTrain)
+    filteredMir <- mirTrain[nonzero > cutoff, ]
+
+    Thresh <- Thresher(t(filteredMir), method = "auer.gervini",
+                       scale = TRUE, agfun = agDimTwiceMean)
+    Reap <- Reaper(Thresh, useLoadings = TRUE, cutoff = 0.35,
+                   metric = NULL, linkage = "ward.D2", maxSampleGroups = 486)
+    f <- file.path(paths$scratch, paste('thresh_reap_miR_fpkm_', k, '.Rda', sep = ''))
+    save(Thresh, Reap, file = f)
+    print(Sys.time() - startTime)
+  }
+}
+rm(f, Thresh, Reap, cutoff, nonzero, filteredMir, tfTrain, mirTrain)
+gc()
+```
+
+## Medoid Computation
+We need to save the medoids: 
+```{r save tf mediods, warning = FALSE}
+
+f <- file.path(paths$scratch, paste('medoids_mir_fpkm_', 5, '.Rda', sep = ''))
+
+if (!file.exists(f)) {
+  set.seed(41053)
+  for (k in 1:nfolds) {
+    print(paste("Fold", k, "mediod finding started."))
+    load(file.path(paths$scratch, paste('train_batch_fpkm_', k, '.Rda', sep = '')))
+    rm(mrnaTrain)
+    
+    load(file.path(paths$scratch, paste('thresh_reap_tf_fpkm_', k, '.Rda', sep = '')))
+    groups <- predict(Reap@fit)
+    names(groups) <- rownames(tfTrain)[Reap@keep]
+    NG <- Reap@nGroups
+    tfMedoid <- matrix(0, ncol(tfTrain), NG)
+    colnames(tfMedoid) <- 1:ncol(tfMedoid)
+    d2MeanList <- list()
+    for (I in 1:NG) {
+      clusterExp <- tfTrain[names(groups)[groups == I], ]
+      meanZeroClusterExp <- sweep(clusterExp, 2, apply(clusterExp, 2, mean))
+      d2Mean <- apply(meanZeroClusterExp, 1, function(x) {sqrt(sum(x * x))})
+      medoidGene <- rownames(clusterExp)[which.min(d2Mean)]
+      tfMedoid[, I] <- tfTrain[medoidGene, ]
+      colnames(tfMedoid)[I] <- medoidGene
+      d2MeanList[[I]] <- d2Mean
+    }
+    f <- file.path(paths$scratch, paste('medoids_tf_fpkm_', k, '.Rda', sep = ''))
+    save(tfMedoid, file = f)
+    f <- file.path(paths$scratch, paste('d2MeanList_tf_fpkm_', k, '.Rda', sep = ''))
+    save(d2MeanList, file = f)
+
+
+
+    load(file.path(paths$scratch, paste('thresh_reap_miR_fpkm_', k, '.Rda', sep = '')))
+    nonzero <- apply(mirTrain, 1, function(x) sum(x != 0))
+    cutoff <- 0.25 * ncol(mirTrain)
+    filteredMir <- mirTrain[nonzero > cutoff, ]
+    
+    groups <- predict(Reap@fit)
+    names(groups) <- rownames(filteredMir)[Reap@keep]
+    NG <- Reap@nGroups
+    mirMedoid <- matrix(0, ncol(filteredMir), NG)
+    colnames(mirMedoid) <- 1:ncol(mirMedoid)
+    d2MeanList <- list()
+    for (I in 1:NG) {
+      clusterExp <- filteredMir[names(groups)[groups == I], ]
+      meanZeroClusterExp <- sweep(clusterExp, 2, apply(clusterExp, 2, mean))
+      d2Mean <- apply(meanZeroClusterExp, 1, function(x) {sqrt(sum(x * x))})
+      medoidGene <- rownames(clusterExp)[which.min(d2Mean)]
+      mirMedoid[, I] <- filteredMir[medoidGene, ]
+      colnames(mirMedoid)[I] <- medoidGene
+      d2MeanList[[I]] <- d2Mean
+    }
+    f <- file.path(paths$scratch, paste('medoids_mir_fpkm_', k, '.Rda', sep = ''))
+    save(mirMedoid, file = f)
+    f <- file.path(paths$scratch, paste('d2MeanList_mir_fpkm_', k, '.Rda', sep = ''))
+    save(d2MeanList, file = f)
+  }
+}
+rm(f, tfMedoid, mirMedoid, groups, NG, d2MeanList, clusterExp, meanZeroClusterExp, d2Mean, medoidGene)
+rm(nonzero, startTime, I, k, cutoff)
+```
+
+## Pseudo-Tissue (Cluster) Aware Linear Model 
+Next, we fit the linear models for each tissue after mean zeroing the outcome (this is equivalent to fit a model to all tissue and then fit the residuals of that model per tissue). 
+
+###Train
+First the training part:
+```{r helpers, warning = FALSE, echo=FALSE}
+library(ClassComparison)
+library(oompaBase)
+
+computeCor <- function(res, Y, ns=10^4){
+  Yhat <- Y - res
+  M <- nrow(Y)
+  Ours <- sapply(1:M, function(i) cor(Y[i,], Yhat[i,]))
+  
+  Yind <- sample(1:M, ns, replace = T)
+  YhatInd <- sample(1:M, ns, replace = T)
+  ind <- cbind(Yind, YhatInd)
+  ind <- ind[Yind != YhatInd, ]
+  Null <- sapply(1:nrow(ind), function(j) cor(Y[ind[j,1],], Yhat[ind[j,2],]))
+  z <- quantile(Null, .95, na.rm = T)
+  acc <- sum(Ours > z, na.rm = T) / M
+  return(list(ours=Ours, null=Null, acc=acc))
+}
+
+
+computeR2 <- function(res, Y){
+  M <- ncol(Y)
+  dmean <- matrixMean(Y)
+  dvar <- as.vector(matrixVar(Y, dmean))
+  ssres <- apply(res ^ 2, 1, sum)
+  r2 <- rep(0, M)
+  # varInd <- dvar != 0
+  # r2[varInd] <- 1 - ssres[varInd] / (dvar[varInd] * (M - 1))
+  r2 <- 1 - ssres / (dvar * (M - 1))
+  return(r2)
+}
+
+```
+
+```{r training, warning = FALSE}
+trainClusterAware <- function(X, Y, nc){
+  coeffMatList <- list()
+  N <- nrow(X); M <- nrow(Y); P <- ncol(X);
+  res <- matrix(0, nrow = M, ncol = N)
+  cat(paste("\n  Trianing with ", nc, " clusters:"))
+  cat("\n    1) Clustering")
+  myClust <- kmeans(X, nc, iter.max = 100, nstart = 100)
+  assignment <- myClust$cluster
+
+  cat("\n    2) Regression")
+  cat("\n      Fitting OLS to clusters 1")
+  for (cluster in 1:nc) {
+    if(cluster %% 5 == 0) cat(paste(cluster)) else cat('.')
+    coeffMat <- matrix(0, nrow = P + 1, ncol = M, 
+                       dimnames = list(c('(Intercept)',
+                                         gsub('\\-', '.', colnames(X))), 
+                                         rownames(Y)))
+    
+    S <- (assignment == cluster) #Cluster Selector
+    #remove constant covariates
+    varCov <- apply(X[S,], 2, var) != 0
+    Xs <- X[S, varCov]
+    mapping <- which(varCov)
+    Ys <- Y[, S]
+    
+    if (nrow(Xs) < ncol(Xs)) {
+      #Not enough samples per cluster
+      #Per-cluster average is our predictor
+      #YcAvg is our predictions and the residuals are mean0Yc
+      # pred[, S] <- matrix(rep(YcAvg, S), ncol = S)
+      coeffMat[1,] <- apply(Ys, 1, mean)#YcAvg 
+      res[, S] <- sweep(Ys, 1, coeffMat[1,])#mean0Yc 
+    } else{
+      tryCatch({
+        mlm <- MultiLinearModel(Y ~ ., Xs, Ys)
+        # pred[, S] <- t(mlm@predictions)
+        # coeffMat[rownames(mlm@coefficients),] <- mlm@coefficients
+        coeffMat[1,] <- mlm@coefficients[1, ]  # +1 to account for the '(Intercept)' row
+        coeffMat[mapping + 1,] <- mlm@coefficients[-1, ]  # +1 to account for the '(Intercept)' row
+        res[, S] <- Ys - t(mlm@predictions)
+        }, error = function(e) {
+          coeffMat[1,] <- apply(Ys, 1, mean)#YcAvg 
+          res[, S] <- sweep(Ys, 1, coeffMat[1,])#mean0Yc 
+      })
+    }
+    coeffMatList[[cluster]] <- coeffMat
+  } 
+  
+  r2 <- computeR2(res, Y)
+  # hist(r2, breaks=123)
+  cat(paste("\n      Average R2:", round(mean(r2, na.rm =T), 2)))
+  rmse <- sqrt((1/N) * apply(res ^ 2, 1, sum))
+  cat(paste("\n      Averge RMSE:", round(mean(rmse),2)))
+  corr <- computeCor(res, Y)
+  cat(paste("\n      Averge Cor:", round(mean(corr$acc),2)))
+  
+  trained <- list(coeffMatList=coeffMatList, nc=nc, 
+                  res=res, r2=r2, rmse=rmse, corr=corr,
+                  centers=myClust$centers)
+  # save(trained, file = file.path(paths$scratch, paste('trained_fpkm_', nc, '.Rda', sep = '')))
+  
+  return(trained)
+}
+
+
+```
+Note that we do not save the whole MLM object, we just keep the coefficient matrix and the performance metrics that we keep track of: R2, RMSE, and Correlation of the prediction with outcome. We also keep the number of clusters and the cluster centers for the testing phase. 
+
+### Test
+Next testing: First for each new test data we find the closest cluster center from the training and then we use the corresponding linear model for prediction. Note that R2 here is not a valid measure because it may become arbitrarily small since any predictive model trained on training data can do worse than the test data mean. So we only compute RMSE and Correlation performances. 
+ 
+```{r test, warning = FALSE}
+testClusterAware <- function(X, Y, model){
+  centers <- model$centers
+  cat(paste("\n  Testing with ", nrow(centers), " clusters:"))
+  M <- nrow(Y); N <- ncol(Y); #nrow(X) == N
+  D <- matrix(0, nrow = N, ncol = nrow(centers))
+  for(i in 1:nrow(centers)){
+    center <- centers[i, ]
+    D[,i] <- apply(X, 1, function(x) sum((x - center)^2))
+  }
+  C <- apply(D, 1, which.min)
+  
+  res <- matrix(0, nrow = M, ncol = N)
+  aX <- cbind(rep(1, nrow(X)), X) #augmented X
+  for(i in 1:nrow(centers)){
+    res[, C==i] <- Y[,C==i] - t(aX[C==i, ] %*% model$coeffMatList[[i]])
+  }
+  rmse <- sqrt((1/N) * apply(res ^ 2, 1, sum))
+  cat(paste("\n    Averge RMSE:", round(mean(rmse),2)))
+  corr <- computeCor(res, Y)
+  # cat(paste("\n    Averge Cor:", round(mean(corr$acc),2)))
+  cat(paste("\n    Averge Cor:", round((corr$acc),2)))
+
+
+  tested <- list(res=res, rmse=rmse, corr=corr)
+  # save(tested, file = file.path(paths$scratch, paste('tested_fpkm_', model$nc, '.Rda', sep = '')))
+  
+  return(tested)
+}
+```
+
+### Cross-Validation
+Finally, we run the model:
+
+```{r mirMLM, warning = FALSE}
+nClusters <- c(1, 5, 10, 15, 20, 25, 30, 35)
+
+f <- file.path(paths$scratch, paste('fold_', 5, '_kmeans_fpkm_', 
+                                          35, '.Rda', sep = ''))
+if (!file.exists(f)) {
+  set.seed(41053)
+  cvTable <- matrix(0, nrow = nfolds, ncol = length(nClusters))
+
+  for (k in 1:nfolds) {
+    cat(paste("\nFold ", k, ": ", sep = ''))
+    # Load Training Samples (tfTrain, mirTrain, mrnaTrain)
+    load(file.path(paths$scratch, paste('train_batch_fpkm_', k, '.Rda', sep = '')))
+    rm(tfTrain, mirTrain)
+    ## Global mean removal for Data Sharing
+    Yavg <- apply(mrnaTrain, 1, mean)
+    mean0Y <- sweep(mrnaTrain, 1, Yavg)
+    ## Load Selected Features
+    load(file.path(paths$scratch, paste('medoids_tf_fpkm_', k, '.Rda', sep = '')))
+    load(file.path(paths$scratch, paste('medoids_mir_fpkm_', k, '.Rda', sep = '')))
+    X <- cbind(tfMedoid, mirMedoid)
+    cat(paste("Dimensions of X is", paste(dim(X), collapse = '*')))
+    # Load Test Samples (tfTest, mirTest, mrnaTest)
+    load(file.path(paths$scratch, paste('test_batch_fpkm_', k, '.Rda', sep = '')))
+    ## Prepare Test Features (match with the selected features of training set)
+    tfTestMedoid <- t(tfTest[colnames(tfMedoid), ])
+    mirTestMedoid <- t(mirTest[colnames(mirMedoid),])
+    Xt <- cbind(tfTestMedoid, mirTestMedoid)
+    mean0Yt <- sweep(mrnaTest, 1, Yavg)
+    
+    cnt <- 0
+    for(nc in nClusters){
+      cnt <- cnt + 1
+      #Train
+      learned <- trainClusterAware(X, mean0Y, nc)
+      #Test
+      tested <- testClusterAware(Xt, mean0Yt, learned)
+      #Save
+      cvTable[k, cnt] <- mean(tested$rmse)
+      f <- file.path(paths$scratch, paste('fold_', k, '_kmeans_fpkm_', 
+                                          nc, '.Rda', sep = ''))
+      cat(paste("\nSaving results of", nc, "clusters for fold", k))
+      save(learned, tested, file = f)
+    }
+  }
+}
+
+rm(f, cvTable, tested, learned, cnt, mean0Yt, Xt, mirTestMedoid, tfTestMedoid, X, mean0Y, Yavg)
+rm(nc, k, cnt)
+gc()
+```
+So the best test performance corresponds to 15 clusters. Let's take a look at the train and test results. 
+
+```{r r2res, warning = FALSE}
+g <- file.path(paths$scratch, 'cvTables_fpkm.Rda')
+if (file.exists(g)) {
+  load(g)
+} else{
+  cvR2Trn <- cvCorrTst <- cvCorrTrn <- cvRmseTst <- cvRmseTrn <- matrix(0, nrow = nfolds, ncol = length(nClusters))
+  colnames(cvR2Trn) <- colnames(cvCorrTst) <- colnames(cvRmseTst) <- paste("nc", nClusters, sep = '-')
+  
+  cnt <- 0
+  for(nc in nClusters){
+    cnt <- cnt + 1
+    cat(paste("\nNumber of clusters:", nc, "Folds"))
+    for (k in 1:nfolds) {
+      cat(paste(" ", k))
+      f <- file.path(paths$scratch, paste('fold_', k, '_kmeans_fpkm_', 
+                                            nc, '.Rda', sep = ''))
+      load(file = f)
+      # print(summary(learned$r2))
+      # hist(learned$r2, breaks=234, 
+      #      main=paste("Number of Clusters=", nc, ",Fold=", k, 
+      #                 ",Average R2=", round(stat['Mean'],2)),
+      #      xlab = "R2")
+      cvR2Trn[k, cnt] <- mean(learned$r2, na.rm=TRUE)
+      cvRmseTst[k, cnt] <- mean(tested$rmse)
+      cvRmseTrn[k, cnt] <- mean(learned$rmse) 
+      cvCorrTst[k, cnt] <- mean(tested$corr$acc)
+      cvCorrTrn[k, cnt] <- mean(learned$corr$acc)
+    }
+  }
+  save(cvR2Trn, cvCorrTst, cvCorrTrn, cvRmseTst, cvRmseTrn, file=g)
+}
+
+print("R2 during training:")
+print(cvR2Trn)
+print(paste("Average train R2:", paste(round(apply(cvR2Trn, 2, mean),3) , collapse = ',')))
+
+print("RMSE for training:")
+print(cvRmseTst)
+print(paste("Best number of clusters according to RMSE:", colnames(cvRmseTst)[which.min(apply(cvRmseTst, 2, mean))]))
+print(paste("Average test RMSE:", paste(round(apply(cvRmseTst, 2, mean),3), collapse = ',')))
+
+print("Corr for training:")
+print(cvCorrTst)
+print(paste("Best number of clusters according to Correlation:", colnames(cvCorrTst)[which.max(apply(cvCorrTst, 2, mean))]))
+print(paste("Average test Corr:", paste(round(apply(cvCorrTst, 2, mean),4), collapse = ',')))
+
+rm(cnt, f)
+```
+We get average of 71% R2, which is pretty good! The test correlation performance is also excellent! 
+
+```{r plot, warning = FALSE}
+library(ggplot2)
+
+plot.cv <- function(cvtrain, cvtest, ytext){
+  yt <- colMeans(cvtest)
+  et <- apply(cvtest, 2, sd)
+  
+  yn <- colMeans(cvtrain)
+  en <- apply(cvtrain, 2, sd)
+  
+  toplot <- data.frame(yt = yt,et = et,yn = yn,en = en,nc = nClusters)
+  
+  ggplot(toplot) +
+    geom_line(aes(x = nc, y = yt, col = "Test"), size = 1) +
+    geom_point(aes(x = nc, y = yt, shape = 'a'), show.legend = FALSE) +
+    geom_line(aes(x = nc, y = yn, col = "Train"), size = 1) +
+    geom_point(aes(x = nc, y = yn, shape = 'c'), show.legend = FALSE) +
+    geom_errorbar(aes(x = nc,ymin = yt - et,ymax = yt + et), width = 0.5) +
+    geom_errorbar(aes(x = nc,ymin = yn - en,ymax = yn + en), width = 0.5) +
+    theme_bw() + xlab("Number of Clusters") + ylab(ytext) +
+    scale_color_manual(values = c("red", "green"), name = "")
+}
+
+load(file.path(paths$scratch, 'cvTables_fpkm.Rda'))
+
+plot.cv(cvRmseTrn, cvRmseTst, "RMSE")
+plot.cv(cvCorrTrn, cvCorrTst, "Correlation")
+
+
+toplotr2 <- data.frame(yt = colMeans(cvR2Trn),
+                       et = apply(cvR2Trn, 2, sd),nc = nClusters)
+ggplot(toplotr2) +
+    geom_line(aes(x = nc, y = yt), size = 1) +
+    geom_point(aes(x = nc, y = yt, shape = 'a'), show.legend = FALSE) +
+    geom_errorbar(aes(x = nc,ymin = yt - et,ymax = yt + et), width = 0.5) +
+    theme_bw() + xlab("Number of Clusters") + ylab("Average R2") 
+
+rm(toplotr2, cvRmseTst, cvRmseTrn, cvCorrTrn, cvCorrTst, cvR2Trn)
+```
+
+
+
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+
+```
+
+
+

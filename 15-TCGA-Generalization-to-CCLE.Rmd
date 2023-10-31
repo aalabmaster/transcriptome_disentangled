@@ -1,0 +1,445 @@
+
+---
+title: "Generalizability and Transportability of Transcriptome Prediction: From TCGA to CCLE"
+author: "Amir Asiaee"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+```{r globopt, echo=FALSE}
+knitr::opts_chunk$set(fig.width=12) 
+```
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+# Getting Started
+
+## Getting the Predictors Right
+
+First, we load the TCGA data to have the name of the predictors (tf and miR medoids) and look for them in the CCLE data. 
+```{r , warning=FALSE}
+rm(list=ls())
+source("00-paths.R")
+
+
+
+load(file.path(paths$clean, 'xena-tcga.Rda'))
+load(file.path(paths$scratch, paste('medoids_tf_all_tpm.Rda', sep = '')))
+load(file.path(paths$scratch, paste('medoids_mir_all_tpm.Rda', sep = '')))
+
+dim(mirMedoid)
+dim(tfMedoid)
+
+load(file.path(paths$clean, 'ccle.Rda'))
+```
+
+```{r , warning = FALSE}
+
+mir_name_cleaner <- function(name){(sub("-(3p|5p)$", "", name))}
+tf_name_cleaner <- function(name){(sub("\\..*$", "", name))}
+  
+find_tcga_medoid_in_ccle <- function(tcga_medoid_names, ccle_feature_names, name_cleaner, d2MeanList, tcga_data, ccle_data){
+  
+  matched_names <- vector("character", length(tcga_medoid_names))
+  for (i in seq_along(tcga_medoid_names)) {
+    name <- tcga_medoid_names[i]
+    d2Mean <- d2MeanList[[i]]
+    d2Mean_sorted <- sort(d2Mean)
+    trial <- 1
+    
+    while(TRUE) {
+      trial <- trial + 1
+      hist(as.numeric(tcga_data[name,]), main=paste('tcga', name), breaks = 123)
+          
+      if (name %in% ccle_feature_names) {
+        matched_names[i] <- name
+        break
+      }
+      
+      name_clean <- name_cleaner(name)
+      # Sometimes mirA-3p has matched to mirA and now mirA-5p is considered
+      # We want to avoid mirA-5p going to mirA again, so we skip it.
+      if (name_clean %in% ccle_feature_names && !(name_clean %in% matched_names)) {
+        matched_names[i] <- name_clean
+        break
+      }
+      next_smallest_value <- d2Mean_sorted[trial]
+      name <- names(d2Mean)[which(d2Mean == next_smallest_value)]
+    }
+    hist(as.numeric(ccle_data[matched_names[i], ]), main=paste('ccle', matched_names[i]), breaks = 123)
+    # print(paste("Converted", name, "in trial", trial - 1, "out of", length(d2Mean), "to", matched_names[i]))
+  }
+  return(matched_names)
+  
+}
+
+load(file.path(paths$scratch, paste('d2MeanList_mir_all_tpm.Rda', sep = '')))
+print("Converting microRNA names:")
+ccle_mir_medoid_names <- find_tcga_medoid_in_ccle(colnames(mirMedoid), rownames(ccle$mir), mir_name_cleaner, d2MeanList, tcga$mir, ccle$mir)
+# length(unique(ccle_mir_medoid_names))
+print("CCLE miR medoid names:")
+ccle_mir_medoid_names
+
+load(file.path(paths$scratch, paste('d2MeanList_tf_all_tpm.Rda', sep = '')))
+cleaned_ccle_tf_names <- sapply(rownames(ccle$tf), tf_name_cleaner)
+print("Converting TF names:")
+rownames(ccle$tf) <- cleaned_ccle_tf_names
+ccle_tf_medoid_names <- find_tcga_medoid_in_ccle(colnames(tfMedoid), cleaned_ccle_tf_names, tf_name_cleaner, d2MeanList, tcga$tf, ccle$tf)
+# length(unique(ccle_tf_medoid_names))
+print("CCLE TF medoid names:")
+ccle_tf_medoid_names
+
+# rm(tfMedoid, mirMedoid)
+```
+
+Now we can select medoids from CCLE data:
+
+```{r , warning = FALSE}
+ccle_tf_medoid <- t(as.matrix(ccle$tf[ccle_tf_medoid_names, ]))
+
+ccle_mir_medoid <- t(as.matrix(ccle$mir[ccle_mir_medoid_names, ]))
+```
+
+
+## Getting the Outcomes Right
+
+Need to know the name of outcomes (TCGA's mRNA) to know what genes to predict in CCLE. 
+
+```{r , warning = FALSE}
+load(file.path(paths$clean, 'xena-tcga.Rda'))
+tcga_mrna_names <- sapply(rownames(tcga$mrna), tf_name_cleaner)
+ccle_mrna_names <- sapply(rownames(ccle$mrna), tf_name_cleaner)
+
+sum(ccle_mrna_names %in% tcga_mrna_names)
+length(ccle_mrna_names)
+
+rm(tcga, cohorts, mRNARest)
+```
+
+It seems that we can predict all of the CCLE's genes!
+
+```{r const computation, warning = FALSE}
+library(ClassComparison)
+
+f <- file.path(paths$scratch, "Y_ccle_tpm.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  # common ordering of names for future
+  Ynames <- intersect(tcga_mrna_names, ccle_mrna_names)
+  Y_ccle <- as.matrix(ccle$mrna[Ynames, ])
+  save(Y_ccle, Ynames, file = f)
+}
+
+length(Ynames)
+dim(Y_ccle)
+```
+
+
+
+# Testing Transportability using the Tissue-Aware model with (TF, miR)
+Load the learned model from TCGA:
+```{r model load, warning = FALSE}
+
+computeCor <- function(res, Y, ns=10^4){
+  res <- as.matrix(res)
+  Y <- as.matrix(Y)
+  Yhat <- Y - res
+  M <- nrow(Y)
+  Ours <- sapply(1:M, function(i) cor(Y[i,], Yhat[i,]))
+  
+  Yind <- sample(1:M, ns, replace = T)
+  YhatInd <- sample(1:M, ns, replace = T)
+  ind <- cbind(Yind, YhatInd)
+  ind <- ind[Yind != YhatInd, ]
+  Null <- sapply(1:nrow(ind), function(j) cor(Y[ind[j,1],], Yhat[ind[j,2],]))
+  z <- quantile(Null, .95, na.rm = T)
+  acc <- sum(Ours > z, na.rm = T) / M
+  return(list(ours=Ours, null=Null, acc=acc))
+}
+
+load(file.path(paths$scratch, paste('final_model_tpm_', 15, '.Rda', sep = '')))
+f <- file.path(paths$scratch, paste('ccle_test_tpm_', model$nc, '.Rda', sep = ''))
+
+if(!file.exists(f)){
+  cleaned_mrna_names <- sapply(rownames(model$alpha), tf_name_cleaner)
+  rownames(model$alpha) <- cleaned_mrna_names
+  Y <- sweep(Y_ccle, 1, model$alpha[Ynames,]) #removing global model intercept
+  X <- cbind(ccle_tf_medoid, ccle_mir_medoid)
+  
+  centers <- model$centers
+  
+  #what if we only use TFs to find the closest centers?
+  cat(paste("\n  Testing with ", nrow(centers), " clusters:"))
+  M <- nrow(Y); N <- ncol(Y); #nrow(X) == N
+  D <- matrix(0, nrow = N, ncol = nrow(centers))
+  for(i in 1:nrow(centers)){
+    center <- centers[i, ]
+    D[,i] <- apply(X, 1, function(x) sum((x - center)^2))
+  }
+  C <- apply(D, 1, which.min)
+  
+  res <- matrix(0, nrow = M, ncol = N)
+  aX <- cbind(rep(1, nrow(X)), X) #augmented X
+  for(i in 1:nrow(centers)){
+    print(paste("Cluster", i, "has size", sum(C==i)))
+    if(sum(C==i) == 0) next;
+    Beta <- model$coeffMatList[[i]]
+    colnames(Beta) <- cleaned_mrna_names
+    res[, C==i] <- Y[,C==i] - t(aX[C==i, ] %*% Beta[,Ynames])
+  }
+  rmse <- sqrt((1/N) * apply(res ^ 2, 1, sum))
+  cat(paste("\n    Averge RMSE:", round(mean(rmse),2)))
+  corr <- computeCor(res, Y_ccle)
+  # corr <- computeCor(res, Y)
+  cat(paste("\n    Averge Cor:", round((corr$acc),2)))
+  ccle_results <- list(res=res, rmse=rmse, corr=corr)
+  save(ccle_results, file = f)
+} else{
+  load(f)
+}
+
+cat(paste("\n    Averge RMSE:", round(mean(ccle_results$rmse),2)))
+cat(paste("\n    Averge Cor:", round((ccle_results$corr$acc),2)))
+
+
+```
+
+```{r , warning = FALSE}
+compute_cor_acc <- function(residuals, y, ns = 10^4){
+  set.seed(12345)
+  yhat <- y - residuals
+  M <- nrow(y)
+  Ours <- sapply(1:M, function(i) cor(y[i,], yhat[i,]))
+  cat("\n Ours info:\n")
+  cat(summary(Ours))
+  
+  Yind <- sample(1:M, ns, replace = T)
+  YhatInd <- sample(1:M, ns, replace = T)
+  ind <- cbind(Yind, YhatInd)
+  ind <- ind[Yind != YhatInd, ]
+  Null <- sapply(1:nrow(ind), function(j) cor(y[ind[j,1],], yhat[ind[j,2],]))
+  
+  # Null <- cor(t(y[ind[,1],]), t(yhat[ind[,2],])) #cor is column-wise
+  
+  
+  z <- quantile(Null, .95, na.rm = T)
+  acc <- sum(Ours > z, na.rm = T) / M
+  cat("\n Null info:\n")
+  cat(summary(Null))
+  cat("\n Cut-off:", z)
+  # Load necessary library
+  
+  # Create separate data frames
+  df_ours <- data.frame(value = Ours, category = "Ours")
+  df_null <- data.frame(value = Null, category = "Null")
+  
+  # Combine data frames
+  df <- rbind(df_ours, df_null)
+  
+  # Plot the histograms
+  library(ggplot2)
+  p <- ggplot(df, aes(x = value, fill = category)) +
+    geom_histogram(aes(y = ..density..), position = "identity", alpha = 0.5, bins = 30) +
+    labs(title = "Histogram of Ours and Null", 
+         x = "Value", 
+         y = "Frequency") +
+    scale_fill_manual(values = c("blue", "red")) +
+    theme_minimal()
+  
+  print(p)
+  
+  return(list(ours=Ours, null=Null, acc=acc))
+}
+
+null_ours_hist_ccle <- compute_cor_acc(ccle_results$res, Y_ccle, 10000)
+
+```
+
+
+The result is not very good. Let's double check the features:
+```{r , warning = FALSE}
+par(mfrow=c(1,2))
+for(p in 1:19){
+  hist(tfMedoid[tfMedoid[, p] >= -9, p], main=colnames(tfMedoid)[p], xlab = "In TCGA", freq = T)
+  hist(ccle_tf_medoid[,p], main=colnames(ccle_tf_medoid)[p], xlab = "In CCLE", freq = T)
+}
+for(p in 1:28){
+  hist(mirMedoid[, p], main=colnames(mirMedoid)[p], xlab = "In TCGA", freq = T)
+  hist(ccle_mir_medoid[,p], main=colnames(ccle_mir_medoid)[p], xlab = "In CCLE", freq = T)
+}
+par(mfrow=c(1,1))
+
+
+```
+Thankfully, TF features are mostly similar but with some extra zeros in TCGA data. For miRs the situation is more complicated. Upon visual inspection, many of the matched microRNAs do not have similar distributions. Worst than that, in some cases matched microRNAs in one database has almost zero distribution which can not be fixed with any method. This shows that it is going to be very difficult to have transportability with microRNAs. 
+
+```{r , warning = FALSE}
+# First, ensure you have the necessary library
+library(transport)
+library(viridis)
+
+
+# Function to calculate fast 1D Wasserstein distance
+fast_wasserstein_1d <- function(P_samples, Q_samples) {
+  P_sorted <- sort(P_samples)
+  Q_sorted <- sort(Q_samples)
+  return(mean(abs(P_sorted - Q_sorted)))
+}
+
+# Update your pairwise_wasserstein function
+pairwise_wasserstein_fast <- function(data1, data2) {
+  n <- ncol(data1)
+  m <- matrix(0, n, n)
+  for (i in 1:n) {
+    for (j in 1:n) {
+      P_samples <- data1[data1[, i]>-9, i]
+      Q_samples <- data2[data2[, i]>-9, j]
+      
+      # Use fast_wasserstein_1d function
+      wasserstein_dist <- fast_wasserstein_1d(P_samples, Q_samples)
+      
+      # Convert to distance
+      m[i, j] <- wasserstein_dist
+    }
+  }
+  return(m)
+}
+
+
+# Compute distance matrices
+tf_distance <- pairwise_wasserstein_fast(tfMedoid, ccle_tf_medoid)
+mir_distance <- pairwise_wasserstein_fast(mirMedoid, ccle_mir_medoid)
+```
+
+
+Now plot them:
+
+```{r , warning = FALSE}
+
+library(ggplot2)
+library(gridExtra)
+
+# Plotting function
+plot_density <- function(distance_matrix, diag_name, off_diag_name, plot_title) {
+  
+  # Create separate data frames
+  df_ours <- data.frame(value = diag(distance_matrix), category = diag_name)
+  df_null <- data.frame(value = c(distance_matrix[upper.tri(distance_matrix)], distance_matrix[lower.tri(distance_matrix)]), category = off_diag_name)
+  
+  # Combine data frames
+  df <- rbind(df_ours, df_null)
+  
+  # Plot the density plots
+  p <- ggplot(df, aes(x = value, fill = category)) +
+    geom_density(aes(y = ..density..), alpha = 0.5) +
+    labs(title = plot_title, 
+         x = "Distance", 
+         y = "Density") +
+    scale_fill_manual(values = c("blue", "red"), name = "") +   # Removing the 'category' label from legend
+    theme_minimal() +
+    theme(legend.position=c(0.95, 0.95), legend.justification=c(1, 1)) +
+    xlim(c(0, NA))   # Setting the x-axis limit starting from zero
+  
+  return(p)
+}
+
+# Call the function for tf_distance
+p_tf <- plot_density(tf_distance, 
+                     "Corresponding Pairs", 
+                     "Non-corresponding Pairs (Null)", 
+                     "Wasserstein Distances between TF Distributions: TCGA vs. CCLE")
+
+# Call the function for mir_distance
+p_mir <- plot_density(mir_distance, 
+                      "Corresponding Pairs", 
+                      "Non-corresponding Pairs (Null)", 
+                      "Wasserstein Distances between miRNA Distributions: TCGA vs. CCLE")
+
+# Combine the plots using grid.arrange and save the result as an object
+combined_plot <- grid.arrange(p_tf, p_mir, ncol = 1, nrow = 2)
+
+# Save the combined plot to a PNG
+ggsave(filename =  file.path(paths$figures, "combined_plot.png"), plot = combined_plot, width = 7, height = 8, units = "in", dpi = 300)
+
+```
+
+Examples:
+
+```{r , warning = FALSE}
+
+top_mirs <- order(diag(mir_distance), decreasing = TRUE)[1:3]
+
+# Define the file name and start the PNG device
+# png(filename = file.path(paths$figures,"miR_histograms.png"), width = 800, height = 800)
+
+# Your existing plotting code with enlarged text elements
+par(mfrow = c(3, 2), mar = c(5, 5, 4, 2))  # Adjusted left margin
+
+
+for (mir in top_mirs) {
+  hist(mirMedoid[,mir], 
+       main = paste("Histogram of miR", colnames(mirMedoid)[mir], "in TCGA"), 
+       col = "blue", 
+       xlim = range(c(mirMedoid[,mir], ccle_mir_medoid[,mir])), 
+       xlab = "Expression", 
+       breaks = 30, 
+       cex.main = 1.5,  # Enlarge main title
+       cex.lab = 1.75,  # Enlarge x and y labels
+       cex.axis = 1.2)  # Enlarge axis tick labels
+  
+  hist(ccle_mir_medoid[,mir], 
+       main = paste("Histogram of miR", colnames(ccle_mir_medoid)[mir], "in CCLE"), 
+       col = "red", 
+       xlim = range(c(mirMedoid[,mir], ccle_mir_medoid[,mir])), 
+       xlab = "Expression", 
+       breaks = 30, 
+       cex.main = 1.5,  # Enlarge main title
+       cex.lab = 1.75,  # Enlarge x and y labels
+       cex.axis = 1.2)  # Enlarge axis tick labels
+}
+
+# Close the PNG device
+# dev.off()
+
+
+
+# Identifying the three TFs with lowest distances
+# top_tfs <- order(diag(tf_distance), decreasing = FALSE)[1:3]
+
+# 
+# for (tf in top_tfs) {
+#   hist(tfMedoid[,tf], main = paste("Histogram of TF", colnames(tfMedoid)[tf], "in TCGA"), col = "blue", xlim = range(c(tfMedoid[,tf], ccle_tf_medoid[,tf])), breaks = 30)
+#   hist(ccle_tf_medoid[,tf], main = paste("Histogram of TF", colnames(ccle_tf_medoid)[tf], "in CCLE"), col = "red", xlim = range(c(tfMedoid[,tf], ccle_tf_medoid[,tf])), breaks = 30)
+# }
+
+```
+
+
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+
+```
+
+
+

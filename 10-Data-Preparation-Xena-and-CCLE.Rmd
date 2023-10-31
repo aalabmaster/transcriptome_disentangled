@@ -1,0 +1,540 @@
+---
+title: "Preparing Xena Browser and CCLE Data"
+author: "Amir Asiaee"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+```{r globopt}
+knitr:::opts_chunk$set(fig.path="../results/mirfigs/")
+knitr::opts_chunk$set(fig.width=12) 
+```
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+
+
+# TL;DR
+In this series of files (numbered 10 and above), we address reviewer feedback. Specifically, we replicate our initial analyses, which were based on RPKM-normalized data, using TPM-normalized data generated through the same bioinformatic pipeline. As anticipated, the replication yielded results consistent with the original, with only minor deviations.
+
+# Xena Browser: TCGA, TARGET, and GTEx Data Preparation
+To ensure the consistency of the bioinformatics processing across our project experiments, especially when transferring models between datasets, we sourced data from the Xena browser. This platform offers RNA-seq reads processed uniformly, as mentioned in their statement: "...we also host results from the UCSC Toil RNA-seq recompute compendium, a uniformly realigned and re-called gene and transcript expression dataset for all TCGA, TARGET (Therapeutically Applicable Research to Generate Effective Treatments), and GTEx (Genotype–Tissue Expression) samples."
+
+The gene expression data for these three datasets can be accessed here: [Xena Browser Data](https://xenabrowser.net/datapages/?dataset=TcgaTargetGtex_rsem_gene_tpm&host=https%3A%2F%2Ftoil.xenahubs.net&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443). To start the analysis, you need to download this large dataset and place it in the `raw` folder.
+
+The provided data comprises expected counts (RSEM) that have been normalized (TPM) and transformed using the formula log2(tpm+0.001). For reference, as noted on their website, the files are either tab-delimited or in the '.tsv' format.
+
+
+```{r globals}
+rm(list=ls())
+source("00-paths.R")
+ls()
+allExpr <- read.table(file.path(paths$raw, "TcgaTargetGtex_rsem_gene_tpm"), header = TRUE, sep = "\t", row.names = 1)
+dim(allExpr)
+
+rownames(allExpr)[1:10]
+colnames(allExpr)[1:10]
+
+apply(allExpr[,1:5], 2, sum)
+# Finding the zero
+MN <- min(allExpr) 
+```
+
+Observations:
+
+- This dataset provides full RNA-seq gene-level data, including all RNAs like mRNA, miR, lncRNAs, and so on. This is clear from its 60k rows, which is more than the usual 20k for protein-coding genes.
+- The initial portion of column names (before the first dot) indicates the study ID, which could be TCGA, GTEX, or TARGET.
+- It's evident that the data has undergone log normalization.
+
+
+## Extraction of MRNAs, Mir, and TF Expression and Separation of TCGA, GTEx, and TARGET from RNA-seq Data
+
+Now, let's extract the rows related to mRNA and miRNA from the RNA-seq data using biomaRt. Since the genes have Ensembl IDs and our list of TFs uses Hugo symbols, we'll also need to get a mapping between Hugo symbols and Ensembl IDs using the biomaRt package.
+
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, 'gene-info.rda');
+if(file.exists(f)) {
+  load(f)
+} else {
+  library(biomaRt)
+  ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+  ens_id <- rownames(allExpr)
+  ens_id_stripped <- gsub("\\..*", "", ens_id)
+  
+  # Include hgnc_symbol in the attributes
+  gene_info <- getBM(attributes = c('ensembl_gene_id', 'gene_biotype', 'hgnc_symbol'), 
+                     filters = 'ensembl_gene_id', 
+                     values = ens_id_stripped, 
+                     mart = ensembl)
+  save(ensembl, ens_id_stripped, gene_info, file = f)
+}
+rm(ens_id, f)
+```
+
+Retrieving ids of different group of genes:
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, 'ensembl_ids.rda');
+if(file.exists(f)) {
+  load(f)
+} else {
+  #Now, we extract protein coding genes and microRNAs:
+  mRNA_ids <- gene_info$ensembl_gene_id[gene_info$gene_biotype == "protein_coding"]
+  miRNA_ids <- gene_info$ensembl_gene_id[gene_info$gene_biotype == "miRNA"]
+  
+  #We separate  TFs using the curated list of genes:
+
+  ## We need hgnc_symbol for mRNA_data to select TFs
+  mRNA_hgnc_symbols <- gene_info$hgnc_symbol[gene_info$gene_biotype == "protein_coding" & gene_info$hgnc_symbol != '']
+  ## Creating a table of frequencies for each Hugo symbol
+  # symbol_frequencies <- table(mRNA_hgnc_symbols)
+  # ## Filtering to show only the Hugo symbols that appear more than once
+  # redundant_symbols <- symbol_frequencies[symbol_frequencies > 1]
+  # print(redundant_symbols)  #only PINX1 which is not a TF
+  # We have one redundant gene but since it is not a predictor (i.e., TF), we keep it. 
+
+  
+  htf <- read.csv(file = file.path(paths$raw, "HumanTF.csv"))
+  tfSymbols <- htf$Hs.SYMBOL
+  tfSymbols <- tfSymbols[!is.na(tfSymbols)]
+  sharedTFs <- mRNA_hgnc_symbols[mRNA_hgnc_symbols %in% tfSymbols]
+  tf_ids <- gene_info$ensembl_gene_id[gene_info$hgnc_symbol %in% sharedTFs]
+  # Sanity check
+  # length(tfSymbols)
+  # length(tf_ids) #a few of them are missing 500 - 487 = 13
+  # # Check what is missing
+  # print(tfSymbols[!(tfSymbols %in% mRNA_hgnc_symbols)])
+  
+  save(tf_ids, mRNA_ids, miRNA_ids, file = f)
+}
+
+rm(ensembl, gene_info, mRNA_hgnc_symbols, htf, tfSymbols, sharedTFs, f)
+```
+
+Note that all three of `mRNA_ids`, `mRNA_ids`, and `mRNA_hgnc_symbols` are ordered according to the arbitrary order of `gene_info` dataframe which is different from `allExpr`. So we should be cautious with indexing of `allExpr` with these ids. Saving the usable indicies:
+
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, 'gene_indicies.rda');
+if(file.exists(f)) {
+  load(f)
+} else {
+  # Index of three types of measurements (there are many more, we use only these three)
+  tf_index <- ens_id_stripped %in% tf_ids
+  mrna_index <- !tf_index & (ens_id_stripped %in% mRNA_ids)
+  mir_index <- ens_id_stripped %in% miRNA_ids
+  types_index <- list(tf = tf_index, mir = mir_index, mrna = mrna_index)
+  save(types_index, file = f)
+}
+print(paste('Number of TFs', sum(types_index$tf), ', Number of miRs', sum(types_index$mir), ', Number of mRNAs', sum(types_index$mrna)))
+
+rm(f, tf_index, tf_ids, mrna_index, mRNA_ids, mir_index, miRNA_ids, ens_id_stripped)
+```
+
+### Checking Zeros
+
+Typically, RNA-seq focuses on polyadenylated (poly-A) RNAs, prioritizing mRNA and often overlooking many non-polyadenylated RNAs, including numerous miRNAs. While it's possible to detect some miRNA reads in a standard RNA-seq experiment, comprehensive and high-quality miRNA profiling demands a dedicated miRNA sequencing protocol. To underscore the limitations of relying on miRNA data derived from conventional RNA-seq for our study's predictive model, we assessed their frequency distribution. Our findings indicate that only 69 out of 1500 microRNAs showed non-zero counts across all three studies.
+
+Next, we'll explore the primary aim of our study: pinpointing and excluding microRNAs with zero expression in at least one of the three studies.
+
+```{r , warning = FALSE}
+# Figuring out studies
+study_indicator <- sapply(colnames(allExpr), function(x) unlist(strsplit(x, "\\."))[1])
+studies <- unique(study_indicator)
+print(paste("There are", length(which(study_indicator == "K")), 'samples belonging to a fourth study which we will remove'))
+# threeExpr <- allExpr[, study_indicator != "K"]
+studies <- studies[studies != "K"]
+
+# Function to filter and report zeros of each type in each study
+filter_and_report <- function(transcript_type, index, study_name) {
+  submatrix <- allExpr[index, study_indicator == study_name]
+  zero_study <- apply(submatrix, 1, function(x) all(x == MN))
+  print(paste("Number of all-zero", transcript_type, "in", study_name, ":", sum(zero_study)))
+  return(zero_study)
+}
+
+# Remove features that are zero across all three datasets
+zero_index_of <- list()
+for (transcript_type in names(types_index)){
+  index <- types_index[[transcript_type]]
+  zero_index_of[[transcript_type]] <- list()
+  for(study in studies){
+    zero_index_of[[transcript_type]][[study]] <- filter_and_report(transcript_type, index, study)
+    print(paste('Number of', transcript_type, 'remained in study', study, ':', sum(!zero_index_of[[transcript_type]][[study]])))
+  }
+  always_zero_at_least_in_one_study <- Reduce("|", zero_index_of[[transcript_type]])
+  # types_index[[transcript_type]] <- index & !always_zero_at_least_in_one_study
+  print(paste('Number of', transcript_type, 'remained:', sum(index & !always_zero_at_least_in_one_study)))
+}
+
+
+rm(study, studies, always_zero_at_least_in_one_study, ens_id_stripped, 
+   index, f, g, h, tf_ids, mRNA_ids, miRNA_ids, transcript_type, filter_and_report)
+```
+
+Our preliminary analysis indicates that only 69 microRNAs register non-zero counts in all three studies. Given this limited number, it's not conducive for further feature selection or predictive analysis. Hence, our subsequent analyses of these three RNA-seq datasets will center on mRNAs (inclusive of TFs). We'll handle TCGA's miR data separately. Furthermore, we'll incorporate CCLE data (sourced outside of the Xena browser), which features cell lines from various cancer types and includes measurements for both mRNA and miRs.
+
+## Separating Rows (TFs and mRNAs) and Columns (TCGA, GTEx, and TARGET)
+
+We want to select TF (predictors) and the rest of gene expression data (mRNAs; outcomes) here to have smaller files to separately load in the future. Since the main learning happens at TCGA, we select features (miR or mRNA) with non-zero counts in TCGA at least once regardless of their values in the other three datasets. 
+
+```{r , warning = FALSE}
+f <- file.path(paths$clean, 'xena-tcga.Rda')
+g <- file.path(paths$clean, 'xena-gtex.Rda')
+h <- file.path(paths$clean, 'xena-target.Rda')
+if (file.exists(f)) {
+  load(f)
+} else {
+  result <- list()
+  # Loop through each unique study and extract data
+  for(study in unique(study_indicator)) {
+    study_data <- list()
+    for(type in c("tf", "mrna")){
+      feature_selector <- types_index[[type]] & !zero_index_of[[type]][["TCGA"]]
+      study_data[[type]] <- allExpr[feature_selector, study_indicator == study] #log2(TPM+0.001)
+    }
+    result[[study]] <- study_data
+  }
+ 
+  # Save the data separately for easier loading 
+  tcga <- result[["TCGA"]]
+  gtex <- result[["GTEX"]]
+  target <- result[["TARGET"]]
+  save(gtex, file = g)
+  save(target, file = h)
+}
+
+dim(tcga$tf)
+dim(tcga$mrna)
+
+rm(study, feature_selector, tf_index, mrna_index, mir_index, ens_id_stripped, 
+   type, tf_ids, mRNA_ids, miRNA_ids, g, h, study_indicator, result, 
+   study_data, types_index, zero_index_of)
+rm(allExpr, gtex, target)
+gc()
+```
+
+# CCLE Data Preparation
+Now we download and pre-process the CCLE data from the [DepMap](https://depmap.org/portal/download/all/) project. We need the TPM normalized gene expression data and miRNA. 
+
+## MRNAs and TF Expression of CCLE
+First we load the gene expression.The data file has one column for gene ensembl id and the second column has the transcript ids that map to that gene. We need to remove that after loading. 
+
+```{r , warning = FALSE}
+ccleExpr <- read.table(file.path(paths$raw, "CCLE_RNAseq_rsem_genes_tpm_20180929.txt"), header = TRUE, sep = "\t", row.names = 1)
+ccleExpr <- ccleExpr[,-1] # Removing the first column
+dim(ccleExpr)
+apply(ccleExpr[,1:5], 2, sum)
+rownames(ccleExpr)[1:5]
+```
+
+We have enough evidence that the data is TPM normalized. Also, ensembl ids need to be stripped. Now selecting TFs and protein coding RNAs:
+
+```{r match ccle with tcga, warning = FALSE}
+ens_id_ccle <- rownames(ccleExpr)
+ccle_ens_id_stripped <- gsub("\\..*", "", ens_id_ccle)
+
+
+ens_id_tcga_mrna <- rownames(tcga$mrna)
+tcga_mrna_ens_id_stripped <- gsub("\\..*", "", ens_id_tcga_mrna)
+
+ens_id_tcga_tf <- rownames(tcga$tf)
+tcga_tf_ens_id_stripped <- gsub("\\..*", "", ens_id_tcga_tf)
+
+ccle_mrna_index <- ccle_ens_id_stripped %in% tcga_mrna_ens_id_stripped
+ccle_tf_index <- ccle_ens_id_stripped %in% tcga_tf_ens_id_stripped
+
+print(paste("Number of TCGA mRNA (outcome) that exist in CCLE:", sum(ccle_mrna_index)))
+print(paste("Number of TCGA TF (outcome) that exist in CCLE:", sum(ccle_tf_index)))
+
+ccle <- list()
+ccle$tf <- log2(ccleExpr[ccle_tf_index, ]+0.001)
+ccle$mrna <- log2(ccleExpr[ccle_mrna_index, ]+0.001)
+
+dim(ccle$tf)
+dim(ccle$mrna)
+
+rm(ens_id_ccle, ccle_ens_id_stripped, ens_id_tcga_mrna, tcga_mrna_ens_id_stripped, 
+   ens_id_tcga_tf, tcga_tf_ens_id_stripped, ccle_mrna_index, ccle_tf_index, ccleExpr)
+```
+
+Note that 482 < 487 (number of TFs measured in the TCGA) and 18706 < 19069 (number of mRNAs to be predicted in TCGA). But these are potentially harmless. Because our feature selection only select a few TFs and we can omit non-existing mRNAs from prediction. 
+
+# Mature miRs of TCGA and CCLE
+
+Until now, we have saved data (gene expression) of TARGET and GTEx. We need to add microRNA data of CCLE and TCGA to their objects and save them. 
+
+## TCGA Mirs
+We load TCGA's microRNA data from [Xena Browser](https://tcga-pancan-atlas-hub.s3.us-east-1.amazonaws.com/download/pancanMiRs_EBadjOnProtocolPlatformWithoutRepsWithUnCorrectMiRs_08_04_16.xena.gz). The data is Batch effects removed, normalized (RPM), and log2(norm_value+1) transformed.  
+
+```{r , warning = FALSE}
+tcga_mir <- read.table(file.path(paths$raw, "pancanMiRs_EBadjOnProtocolPlatformWithoutRepsWithUnCorrectMiRs_08_04_16"), header = TRUE, sep = "\t", row.names = 1)
+dim(tcga_mir)
+tcga_mir[1:5,1:5]
+apply(tcga_mir[,1:5], 2, sum)
+summary(tcga_mir[,1])
+apply(2^tcga_mir[,1:5], 2, sum)
+```
+
+The last output shows that the normalized values are RPM and then they log transform the data. 
+
+But there are some negative values in the data which is meaningless: The minimum should be zero (rpm + 1 = 2^negative means rpm is negative!). We assume that these are numerical issues and set them to zero:
+
+```{r , warning = FALSE}
+hist(tcga_mir[tcga_mir < 0])
+tcga_mir[tcga_mir < 0] <- 0
+```
+
+
+## CCLE Mirs
+
+First loading CCLE data after downloading it from [DepMap](https://depmap.org/portal/download/all/):
+
+```{r , warning = FALSE}
+ccle_mir <- read.table(file.path(paths$raw, "CCLE_miRNA_20181103.gct"), skip = 2, header = TRUE, sep = "\t", row.names = 1)
+ccle_mir[1:5, 1:5]
+nrow(ccle_mir) == length(unique(ccle_mir$Description)) #Is it safe to use description as rownames?
+rownames(ccle_mir) <- ccle_mir$Description
+ccle_mir <- ccle_mir[, -1]
+dim(ccle_mir)
+ccle_mir[1:5,1:5]
+apply(ccle_mir[,1:5], 2, sum)
+min(ccle_mir)
+```
+
+Looking at the row names, it is odd that some rows of miR data in CCLE has names that are the combination of multiple miRs. We will be worry about these when doing the transportability experiment. 
+
+### The CCLE Mir Normalization Issue
+It is hard to tell if or how the data is normalized. The supplement of CCLE paper says they use nSolver of Nanostring to normalize the data and do QC and get N and then log2(N+50) is what they use in their analysis. But this data can not be log(of any count) because the count will be infinity (since the values are north of thousands). The minimum is also not zero, therefore, our best guess it that the values are estimated count N. And they are not RPM normalized. 
+So, we need to RPM and log normalize the estimated counts:
+
+```{r , warning = FALSE}
+# RPM normalization
+rpm_normalized_ccle_mir <- as.data.frame(apply(floor(ccle_mir), 2, function(col) (col / sum(col)) * 1e6)) 
+dimnames(rpm_normalized_ccle_mir) <- dimnames(ccle_mir)
+
+rm(ccle_mir)
+```
+
+Let's save all miRs:
+
+```{r , warning = FALSE}
+tcga$mir <- tcga_mir
+ccle$mir <- log2(rpm_normalized_ccle_mir+1)
+
+rm(rpm_normalized_ccle_mir, tcga_mir)
+```
+
+## Match Mir and TF Samples of TCGA and CCLE
+As you see, the number of samples are not the same for miR and TF. Let's only keep samples for which we have both and also unify the order of columns:
+```{r match tf and mir, warning = FALSE}
+# Find common columns
+common_cols <- intersect(colnames(tcga$tf), colnames(tcga$mir))
+
+# Subset both data frames to only include the common columns
+tcga$tf <- tcga$tf[, common_cols, drop=FALSE]
+tcga$mir <- tcga$mir[, common_cols, drop=FALSE]
+tcga$mrna <- tcga$mrna[, common_cols, drop=FALSE]
+
+
+common_cols <- intersect(colnames(ccle$tf), colnames(ccle$mir))
+
+# Subset both data frames to only include the common columns
+ccle$tf <- ccle$tf[, common_cols, drop=FALSE]
+ccle$mir <- ccle$mir[, common_cols, drop=FALSE]
+ccle$mrna <- ccle$mrna[, common_cols, drop=FALSE]
+
+save(ccle, file = file.path(paths$clean, 'ccle.Rda'))
+
+rm(common_cols, ccle)
+```
+
+# Cohorts (Cancer Types and Tissue) for TCGA and CCLE
+
+Finally, for the original tissue-aware model, we need to know the tissue information of the samples of the TCGA. Here we find cancer type of each tcga sample. We need the meta data of Xena-Browser: [Meta](https://xenabrowser.net/datapages/?dataset=TCGA_phenotype_denseDataOnlyDownload.tsv&host=https%3A%2F%2Fpancanatlas.xenahubs.net&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443)
+
+```{r , warning = FALSE}
+xena_sampleid_to_tissue <- read.table(file.path(paths$raw, "TCGA_phenotype_denseDataOnlyDownload.tsv"), header = TRUE, sep = "\t", row.names = 1)
+
+colnames(xena_sampleid_to_tissue)[3] <- "tissue"
+
+sort(unique(xena_sampleid_to_tissue$tissue))
+min(table(xena_sampleid_to_tissue$tissue)) #min number of sample per tissue
+```
+
+TCGA originally had 38 cancer type, here we see 33 types for the samples. So, Xena has already thrown away cancer types that are small in sample size. 
+
+We want to find abbreviated names of cancer types and define colors for them. We get the mapping of abbreviations to description from FireBrowse:
+
+```{r , warning = FALSE}
+# get the list of cohorts
+library(rjson)
+fetch <- function(myurl) {
+  stuff <- paste(readLines(myurl), collapse='')
+  if (stuff=="") return(NULL)
+  struct <- fromJSON(stuff)
+  length(struct)
+  names(struct)
+  gunk <- struct[[1]]
+  NR <- length(gunk)
+  NC <- length(gunk[[1]])
+  daft <- matrix("", nrow=NR, ncol=NC)
+  for (i in 1:NR) {
+    for (j in 1:NC) {
+      x <- gunk[[i]][[j]]
+      daft[i,j] <- ifelse(is.null(x), NA, x)
+    }
+  }
+  colnames(daft) <- names(gunk[[1]])
+  daft <- as.data.frame(daft)
+  daft
+}
+
+myurl <- "http://firebrowse.org/api/v1/Metadata/Cohorts?format=json"
+cohorts <- fetch(myurl)
+rm(myurl)
+cohorts
+nrow(cohorts)
+
+rm(fetch)
+```
+
+The description column of the mapping from Firebrowse is not exactly a match for Xena meta file, so we manually math them:
+
+```{r , warning = FALSE}
+cohorts$x_description <- cohorts$description
+cohorts$x_description[cohorts$description == "Adrenocortical carcinoma"] <- "adrenocortical cancer"
+cohorts$x_description[cohorts$description == "Bladder Urothelial Carcinoma"] <- "bladder urothelial carcinoma"
+cohorts$x_description[cohorts$description == "Breast invasive carcinoma"] <- "breast invasive carcinoma"
+cohorts$x_description[cohorts$description == "Cervical squamous cell carcinoma and endocervical adenocarcinoma"] <- "cervical & endocervical cancer"
+cohorts$x_description[cohorts$description == "Cholangiocarcinoma"] <- "cholangiocarcinoma"
+cohorts$x_description[cohorts$description == "Colon adenocarcinoma"] <- "colon adenocarcinoma"
+cohorts$x_description[cohorts$description == "Colorectal adenocarcinoma"] <- ""
+cohorts$x_description[cohorts$description == "Lymphoid Neoplasm Diffuse Large B-cell Lymphoma"] <- "diffuse large B-cell lymphoma"
+cohorts$x_description[cohorts$description == "Esophageal carcinoma "] <- "esophageal carcinoma"
+cohorts$x_description[cohorts$description == "FFPE Pilot Phase II"] <- ""
+cohorts$x_description[cohorts$description == "Glioblastoma multiforme"] <- "glioblastoma multiforme"
+cohorts$x_description[cohorts$description == "Glioma"] <- ""
+cohorts$x_description[cohorts$description == "Head and Neck squamous cell carcinoma"] <- "head & neck squamous cell carcinoma"
+cohorts$x_description[cohorts$description == "Kidney Chromophobe"] <- "kidney chromophobe"
+cohorts$x_description[cohorts$description == "Pan-kidney cohort (KICH+KIRC+KIRP)"] <- ""
+cohorts$x_description[cohorts$description == "Kidney renal clear cell carcinoma"] <- "kidney clear cell carcinoma"
+cohorts$x_description[cohorts$description == "Kidney renal papillary cell carcinoma"] <- "kidney papillary cell carcinoma"
+cohorts$x_description[cohorts$description == "Acute Myeloid Leukemia"] <- "acute myeloid leukemia"
+cohorts$x_description[cohorts$description == "Brain Lower Grade Glioma"] <- "brain lower grade glioma"
+cohorts$x_description[cohorts$description == "Liver hepatocellular carcinoma"] <- "liver hepatocellular carcinoma"
+cohorts$x_description[cohorts$description == "Lung adenocarcinoma"] <- "lung adenocarcinoma"
+cohorts$x_description[cohorts$description == "Lung squamous cell carcinoma"] <- "lung squamous cell carcinoma"
+cohorts$x_description[cohorts$description == "Mesothelioma"] <- "mesothelioma"
+cohorts$x_description[cohorts$description == "Ovarian serous cystadenocarcinoma"] <- "ovarian serous cystadenocarcinoma"
+cohorts$x_description[cohorts$description == "Pancreatic adenocarcinoma"] <- "pancreatic adenocarcinoma"
+cohorts$x_description[cohorts$description == "Pheochromocytoma and Paraganglioma"] <- "pheochromocytoma & paraganglioma"
+cohorts$x_description[cohorts$description == "Prostate adenocarcinoma"] <- "prostate adenocarcinoma"
+cohorts$x_description[cohorts$description == "Rectum adenocarcinoma"] <- "rectum adenocarcinoma"
+cohorts$x_description[cohorts$description == "Sarcoma"] <- "sarcoma"
+cohorts$x_description[cohorts$description == "Skin Cutaneous Melanoma"] <- "skin cutaneous melanoma"
+cohorts$x_description[cohorts$description == "Stomach adenocarcinoma"] <- "stomach adenocarcinoma"
+cohorts$x_description[cohorts$description == "Stomach and Esophageal carcinoma"] <- ""
+cohorts$x_description[cohorts$description == "Testicular Germ Cell Tumors"] <- "testicular germ cell tumor"
+cohorts$x_description[cohorts$description == "Thyroid carcinoma"] <- "thyroid carcinoma"
+cohorts$x_description[cohorts$description == "Thymoma"] <- "thymoma"
+cohorts$x_description[cohorts$description == "Uterine Corpus Endometrial Carcinoma"] <- "uterine corpus endometrioid carcinoma"
+cohorts$x_description[cohorts$description == "Uterine Carcinosarcoma"] <- "uterine carcinosarcoma"
+cohorts$x_description[cohorts$description == "Uveal Melanoma"] <- "uveal melanoma"
+cohorts <- cohorts[cohorts$x_description != "", ]
+
+length(unique(cohorts$x_description))
+head(cohorts)
+```
+
+In the above, for the missing 5 cancer type in the Xena data, we put "". 
+
+Now we define colors for each cancer type (tissue):
+
+```{r , warning = FALSE}
+library(Polychrome)
+p36 <- palette36.colors(36)
+cohortColors <- createPalette(33, p36[3:35])[1:33]
+names(cohortColors) <- as.character(cohorts$cohort)
+swatch(cohortColors)
+cohorts$color <- cohortColors
+
+rownames(cohorts) <- cohorts$cohort
+cohorts$cohort <- NULL
+
+rm(p36, cohortColors)
+```
+Now getting the cancer type vector:
+
+```{r  , warning = FALSE}
+rownames(xena_sampleid_to_tissue) <- gsub("-", "\\.", rownames(xena_sampleid_to_tissue))
+
+lookup <- setNames(rownames(cohorts), cohorts$x_description)
+
+xena_sampleid_to_tissue$cohort <- lookup[xena_sampleid_to_tissue$tissue]
+
+sample_to_cohort <- setNames(xena_sampleid_to_tissue$cohort, rownames(xena_sampleid_to_tissue))
+
+tcga$tissue <- sample_to_cohort[colnames(tcga$tf)]
+
+
+# Sanity check: frq. of types in tcga$tissue should be less than before
+table(tcga$tissue)
+
+table(xena_sampleid_to_tissue$tissue)
+
+tcga$tissue[1:5]
+xena_sampleid_to_tissue[names(tcga$tissue[1:5]),]$tissue
+
+min(table(tcga$tissue))
+
+rm(xena_sampleid_to_tissue, lookup, sample_to_cohort)
+```
+
+Interestingly, the minimum number sample per tissue has changed to 5 (before it was 45). A closer look reveals the GBM (Glioblastoma Multiforme) is the issue, i.e., it does not have microRNA measured for most of its samples. So to prevent computational issues, we remove GBM samples:
+
+```{r , warning = FALSE}
+# Determine the columns to be removed
+cols_to_remove <- which(tcga$tissue == 'GBM')
+
+# Remove those columns from the specified data frames
+tcga$tissue <- tcga$tissue[-cols_to_remove]
+tcga$mrna <- tcga$mrna[-cols_to_remove]
+tcga$mir <- tcga$mir[,-cols_to_remove]
+tcga$tf <- tcga$tf[,-cols_to_remove]
+
+cohorts <- cohorts[rownames(cohorts) != 'GBM', ]
+
+rm(cols_to_remove)
+```
+
+
+```{r , warning = FALSE}
+save(cohorts, tcga, file = f)
+```
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+
+```
+
+
+
+

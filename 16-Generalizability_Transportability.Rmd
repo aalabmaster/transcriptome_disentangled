@@ -1,0 +1,460 @@
+
+---
+title: "Generalizability and Transportability of Transcriptome Prediction"
+author: "Amir Asiaee"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+```{r globopt, echo=FALSE}
+knitr::opts_chunk$set(fig.width=12) 
+```
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+# Getting Started
+
+One reason that makes the transportability a failure, is the inconsistency between the distributions of the matched miRs. So the part of the model that uses miRs will even hurt the prediction. To mitigate this issue, we won't consider miRs here and train a model solely on TFs. Here we will not redo the cross-validation for determining the number of tissues and use 15 tissues to train the model. This is can only hurt our model because target datsets are separate, unseen test data sets. 
+
+
+```{r globals}
+rm(list=ls())
+source("00-paths.R")
+library(ClassComparison)
+
+ls()
+```
+
+# Training 
+
+Note that since miR and TF features are selected separately, we do not need to redo feature selections here. We just remove miRs from consideration. 
+
+```{r , warning = FALSE}
+load(file.path(paths$clean, 'xena-tcga.Rda'))
+load(file.path(paths$scratch, paste('medoids_tf_all_tpm.Rda', sep = '')))
+dim(tfMedoid)
+dim(tcga$mrna)
+mRNARest <- as.matrix(tcga$mrna)
+```
+
+## Regression
+
+```{r helpers, warning = FALSE, echo=FALSE}
+computeCor <- function(res, Y, ns=10^4){
+  res <- as.matrix(res)
+  Y <- as.matrix(Y)
+  Yhat <- Y - res
+  M <- nrow(Y)
+  Ours <- sapply(1:M, function(i) cor(Y[i,], Yhat[i,]))
+  
+  Yind <- sample(1:M, ns, replace = T)
+  YhatInd <- sample(1:M, ns, replace = T)
+  ind <- cbind(Yind, YhatInd)
+  ind <- ind[Yind != YhatInd, ]
+  Null <- sapply(1:nrow(ind), function(j) cor(Y[ind[j,1],], Yhat[ind[j,2],]))
+  z <- quantile(Null, .95, na.rm = T)
+  acc <- sum(Ours > z, na.rm = T) / M
+  
+  # Create separate data frames
+  df_ours <- data.frame(value = Ours, category = "Ours")
+  df_null <- data.frame(value = Null, category = "Null")
+
+  # Combine data frames
+  df <- rbind(df_ours, df_null)
+
+  # Plot the histograms
+  library(ggplot2)
+  p <- ggplot(df, aes(x = value, fill = category)) +
+    geom_histogram(aes(y = ..density..), position = "identity", alpha = 0.5, bins = 30) +
+    labs(title = "Histogram of Ours and Null",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("blue", "red")) +
+    theme_minimal()
+
+  print(p)
+  
+  return(list(ours=Ours, null=Null, thresh=z, acc=acc))
+}
+
+computeR2 <- function(res, Y){
+  res <- as.matrix(res)
+  Y <- as.matrix(Y)
+  M <- ncol(Y)
+  dmean <- matrixMean(Y)
+  dvar <- as.vector(matrixVar(Y, dmean))
+  ssres <- apply(res^2, 1, sum)
+  r2 <- rep(0, M)
+  # varInd <- dvar != 0
+  # r2[varInd] <- 1 - ssres[varInd] / (dvar[varInd] * (M - 1))
+  r2 <- 1 - ssres / (dvar * (M - 1))
+  return(r2)
+}
+
+compute_cor_acc <- function(residuals, y, Null, thresh){
+  set.seed(12345)
+  yhat <- y - residuals
+  M <- nrow(y)
+  Ours <- sapply(1:M, function(i) cor(y[i,], yhat[i,]))
+  cat("\n Ours info:\n")
+  cat(summary(Ours))
+  
+  acc <- sum(Ours > thresh, na.rm = T) / M
+
+  # Create separate data frames
+  df_ours <- data.frame(value = Ours, category = "Ours")
+  df_null <- data.frame(value = Null, category = "Null")
+
+  # Combine data frames
+  df <- rbind(df_ours, df_null)
+
+  # Plot the histograms
+  library(ggplot2)
+  p <- ggplot(df, aes(x = value, fill = category)) +
+    geom_histogram(aes(y = ..density..), position = "identity", alpha = 0.5, bins = 30) +
+    labs(title = "Histogram of Ours and Null",
+         x = "Value",
+         y = "Frequency") +
+    scale_fill_manual(values = c("blue", "red")) +
+    theme_minimal()
+
+  print(p)
+
+  # return(list(ours=Ours, null=Null, acc=acc))
+  return(acc)
+}
+
+```
+
+Training on TCGA data using only TF:
+```{r , warning = FALSE}
+
+nc <- 15
+f <- file.path(paths$scratch, paste('final_model_tf_only', nc, '.Rda', sep = ''))
+if (!file.exists(f)) {
+  set.seed(1234)
+  Yavg <- as.matrix(apply(mRNARest, 1, mean))
+  Y <- as.matrix(sweep(mRNARest, 1, Yavg))
+  X <- as.matrix(tfMedoid)
+  
+  coeffMatList <- list()
+  N <- nrow(X); M <- nrow(Y); P <- ncol(X);
+  res <- matrix(0, nrow = M, ncol = N)
+  
+  cat(paste("\n  Learning a model with ", nc, " clusters:"))
+  cat("\n    1) Clustering")
+  myClust <- kmeans(X, nc, iter.max = 100, nstart = 100)
+  assignment <- myClust$cluster
+
+  cat("\n    2) Regression")
+  cat("\n      Fitting OLS to clusters 1")
+  
+  for (cluster in 1:nc) {
+    if(cluster %% 5 == 0) cat(paste(cluster)) else cat('.')
+    coeffMat <- matrix(0, nrow = P + 1, ncol = M, 
+                       dimnames = list(c('(Intercept)',
+                                         gsub('\\-', '.', colnames(X))), 
+                                         rownames(Y)))
+    
+    S <- (assignment == cluster) #Cluster Selector
+    varCov <- apply(X[S,], 2, var) != 0
+    Xs <- X[S, varCov]
+     # Create a mapping from variable genes to their positions in the original data
+    mapping <- which(varCov)
+    Ys <- Y[, S]
+    
+    if (nrow(Xs) < ncol(Xs)) {
+      print("Not enough samples, using the means.")
+      coeffMat[1,] <- apply(Ys, 1, mean)#YcAvg 
+      res[, S] <- sweep(Ys, 1, coeffMat[1,])#mean0Yc 
+    } else{
+      mlm <- MultiLinearModel(Y ~ ., Xs, Ys)
+      # Update the coeffMat only for variable genes, leaving others as zero
+      coeffMat[1,] <- mlm@coefficients[1, ]  # +1 to account for the '(Intercept)' row
+      coeffMat[mapping + 1,] <- mlm@coefficients[-1, ]  # +1 to account for the '(Intercept)' row
+      res[, S] <- Ys - t(mlm@predictions)
+    }
+    coeffMatList[[cluster]] <- coeffMat
+  } 
+  
+  r2 <- computeR2(res, Y)
+  cat(paste("\n      Average R2:", round(mean(r2, na.rm =T), 2)))
+  rmse <- sqrt((1/N) * apply(res^2, 1, sum))
+  cat(paste("\n      Averge RMSE:", round(mean(rmse),2)))
+  corr <- computeCor(res, Y)
+  cat(paste("\n      Averge Cor:", round(mean(corr$acc),2)))
+  
+  model <- list(coeffMatList=coeffMatList, nc=nc,
+                  res=res, r2=r2, rmse=rmse, corr=corr,
+                  centers=myClust$centers, alpha=Yavg)
+
+  save(model, file = f)
+} else {
+  load(f)
+}
+
+hist(model$r2, breaks=123, main="R2", xlab=paste("Average R2 =", round(mean(model$r2, na.rm =T), 2)))
+print(paste("\n      Average R2:", round(mean(model$r2, na.rm =T), 2)))
+print(paste("\n      Average RMSE:", round(mean(model$rmse, na.rm =T), 2)))
+print(paste("\n      Average Cor Score:", round(model$corr$acc, 2)))
+
+
+rm(coeffMat, coeffMatList, mlm, res, r2, rmse, corr, Yavg, myClust, Y, Ys, X, Xs)
+```
+
+
+# Testing
+First let's select the corresponding submatrix of data for the three test datasets. 
+```{r , warning = FALSE}
+load(file.path(paths$clean, 'ccle.Rda'))
+```
+
+## CCLE
+
+### Preparing Input: X
+
+```{r , warning = FALSE}
+tf_name_cleaner <- function(name){(sub("\\..*$", "", name))}
+
+find_tcga_medoid_in_ccle <- function(tcga_medoid_names, ccle_feature_names, name_cleaner, d2MeanList, tcga_data, ccle_data){
+  
+  matched_names <- vector("character", length(tcga_medoid_names))
+  for (i in seq_along(tcga_medoid_names)) {
+    name <- tcga_medoid_names[i]
+    d2Mean <- d2MeanList[[i]]
+    d2Mean_sorted <- sort(d2Mean)
+    trial <- 1
+    
+    while(TRUE) {
+      trial <- trial + 1
+      # hist(as.numeric(tcga_data[name,]), main=paste('tcga', name), breaks = 123)
+          
+      if (name %in% ccle_feature_names) {
+        matched_names[i] <- name
+        break
+      }
+      
+      name_clean <- name_cleaner(name)
+      # Sometimes mirA-3p has matched to mirA and now mirA-5p is considered
+      # We want to avoid mirA-5p going to mirA again, so we skip it.
+      if (name_clean %in% ccle_feature_names && !(name_clean %in% matched_names)) {
+        matched_names[i] <- name_clean
+        break
+      }
+      next_smallest_value <- d2Mean_sorted[trial]
+      name <- names(d2Mean)[which(d2Mean == next_smallest_value)]
+    }
+    # hist(as.numeric(ccle_data[matched_names[i], ]), main=paste('ccle', matched_names[i]), breaks = 123)
+    # print(paste("Converted", name, "in trial", trial - 1, "out of", length(d2Mean), "to", matched_names[i]))
+  }
+  return(matched_names)
+  
+}
+
+load(file.path(paths$scratch, paste('d2MeanList_tf_all.Rda', sep = '')))
+cleaned_ccle_tf_names <- sapply(rownames(ccle$tf), tf_name_cleaner)
+print("Converting TF names:")
+rownames(ccle$tf) <- cleaned_ccle_tf_names
+ccle_tf_medoid_names <- find_tcga_medoid_in_ccle(colnames(tfMedoid), cleaned_ccle_tf_names, tf_name_cleaner, d2MeanList, tcga$tf, ccle$tf)
+
+ccle_tf_medoid <- t(as.matrix(ccle$tf[ccle_tf_medoid_names, ]))
+```
+
+### Preparing Output: Y
+```{r , warning = FALSE}
+tcga_mrna_names <- sapply(rownames(tcga$mrna), tf_name_cleaner)
+ccle_mrna_names <- sapply(rownames(ccle$mrna), tf_name_cleaner)
+
+sum(ccle_mrna_names %in% tcga_mrna_names)
+length(ccle_mrna_names)
+```
+It seems we can predict everything. 
+
+Getting same names and order for outcomes:
+
+```{r const computation, warning = FALSE}
+library(ClassComparison)
+
+f <- file.path(paths$scratch, "Y_ccle.Rda")
+if (file.exists(f)) {
+  load(f)
+} else {
+  # common ordering of names for future
+  Ynames <- intersect(tcga_mrna_names, ccle_mrna_names)
+  Y_ccle <- as.matrix(ccle$mrna[Ynames, ])
+  save(Y_ccle, Ynames, file = f)
+}
+
+length(Ynames)
+dim(Y_ccle)
+```
+
+### Prediction
+
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, paste('ccle_test_tf_only', model$nc, '.Rda', sep = ''))
+
+if(!file.exists(f)){
+  cleaned_mrna_names <- sapply(rownames(model$alpha), tf_name_cleaner)
+  rownames(model$alpha) <- cleaned_mrna_names
+  Y <- sweep(Y_ccle, 1, model$alpha[Ynames,]) #removing global model intercept
+  # Y <- sweep(Y_ccle, 1, apply(Y_ccle, 1, mean)) #removing global model intercept
+  X <- ccle_tf_medoid
+  
+  centers <- model$centers
+  
+  cat(paste("\n  Testing with ", nrow(centers), " clusters:"))
+  M <- nrow(Y); N <- ncol(Y); #nrow(X) == N
+  D <- matrix(0, nrow = N, ncol = nrow(centers))
+  for(i in 1:nrow(centers)){
+    center <- centers[i, ]
+    D[,i] <- apply(X, 1, function(x) sum((x - center)^2))
+  }
+  C <- apply(D, 1, which.min)
+  
+  res <- matrix(0, nrow = M, ncol = N)
+  aX <- cbind(rep(1, nrow(X)), X) #augmented X
+  for(i in 1:nrow(centers)){
+    print(paste("Cluster", i, "has size", sum(C==i)))
+    if(sum(C==i) == 0) next;
+    Beta <- model$coeffMatList[[i]]
+    colnames(Beta) <- cleaned_mrna_names
+    res[, C==i] <- Y[,C==i] - t(aX[C==i, ] %*% Beta[,Ynames])
+  }
+  rmse <- sqrt((1/N) * apply(res ^ 2, 1, sum))
+  cat(paste("\n    Averge RMSE:", round(mean(rmse),2)))
+  corr <- computeCor(res, Y_ccle)
+  cat(paste("\n    Averge Cor:", round(corr$acc,2)))
+  ccle_results <- list(res=res, rmse=rmse, corr=corr)
+  save(ccle_results, file = f)
+} else{
+  load(f)
+}
+
+cat(paste("\n    Averge RMSE:", round(mean(ccle_results$rmse),2)))
+cat(paste("\n    Averge Cor:", round((ccle_results$corr$acc),2)))
+```
+
+## GTEx and TARGET
+
+### Prediction GTEx
+
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, paste('gtex_test_tf_only', model$nc, '.Rda', sep = ''))
+load(file.path(paths$clean, 'xena-gtex.Rda'))
+
+
+if(!file.exists(f)){
+  Y <- sweep(as.matrix(gtex$mrna), 1, model$alpha) #removing global model intercept
+  X <- t(as.matrix(gtex$tf))
+  X <- X[, colnames(tfMedoid)]
+  
+  centers <- model$centers
+  
+  cat(paste("\n  Testing with ", nrow(centers), " clusters:"))
+  M <- nrow(Y); N <- ncol(Y); #nrow(X) == N
+  D <- matrix(0, nrow = N, ncol = nrow(centers))
+  for(i in 1:nrow(centers)){
+    center <- centers[i, ]
+    D[,i] <- apply(X, 1, function(x) sum((x - center)^2))
+  }
+  C <- apply(D, 1, which.min)
+  
+  res <- matrix(0, nrow = M, ncol = N)
+  aX <- cbind(rep(1, nrow(X)), X) #augmented X
+  for(i in 1:nrow(centers)){
+    print(paste("Cluster", i, "has size", sum(C==i)))
+    if(sum(C==i) == 0) next;
+    Beta <- model$coeffMatList[[i]]
+    res[, C==i] <- Y[,C==i] - t(aX[C==i, ] %*% Beta)
+  }
+  rmse <- sqrt((1/N) * apply(res ^ 2, 1, sum))
+  cat(paste("\n    Averge RMSE:", round(mean(rmse),2)))
+  # corr <- computeCor(res, Y_ccle)
+  corr <- compute_cor_acc(res, Y, model$corr$null, model$corr$thresh)
+  cat(paste("\n    Averge Cor:", round(corr,2)))
+  gtex_results <- list(res=res, rmse=rmse, corr=corr)
+  save(gtex_results, file = f)
+} else{
+  load(f)
+}
+
+cat(paste("\n    Averge RMSE:", round(mean(gtex_results$rmse),2)))
+cat(paste("\n    Averge Cor:", round((gtex_results$corr),2)))
+```
+
+### Prediction TARGET
+
+```{r , warning = FALSE}
+f <- file.path(paths$scratch, paste('target_test_tf_only', model$nc, '.Rda', sep = ''))
+load(file.path(paths$clean, 'xena-target.Rda'))
+
+
+if(!file.exists(f)){
+  Y <- sweep(as.matrix(target$mrna), 1, model$alpha) #removing global model intercept
+  X <- t(as.matrix(target$tf))
+  X <- X[, colnames(tfMedoid)]
+  
+  centers <- model$centers
+  
+  cat(paste("\n  Testing with ", nrow(centers), " clusters:"))
+  M <- nrow(Y); N <- ncol(Y); #nrow(X) == N
+  D <- matrix(0, nrow = N, ncol = nrow(centers))
+  for(i in 1:nrow(centers)){
+    center <- centers[i, ]
+    D[,i] <- apply(X, 1, function(x) sum((x - center)^2))
+  }
+  C <- apply(D, 1, which.min)
+  
+  res <- matrix(0, nrow = M, ncol = N)
+  aX <- cbind(rep(1, nrow(X)), X) #augmented X
+  for(i in 1:nrow(centers)){
+    print(paste("Cluster", i, "has size", sum(C==i)))
+    if(sum(C==i) == 0) next;
+    Beta <- model$coeffMatList[[i]]
+    res[, C==i] <- Y[,C==i] - t(aX[C==i, ] %*% Beta)
+  }
+  rmse <- sqrt((1/N) * apply(res ^ 2, 1, sum))
+  cat(paste("\n    Averge RMSE:", round(mean(rmse),2)))
+  # corr <- computeCor(res, Y_ccle)
+  corr <- compute_cor_acc(res, Y, model$corr$null, model$corr$thresh)
+  cat(paste("\n    Averge Cor:", round(corr,2)))
+  target_results <- list(res=res, rmse=rmse, corr=corr)
+  save(target_results, file = f)
+} else{
+  load(f)
+}
+
+cat(paste("\n    Averge RMSE:", round(mean(target_results$rmse),2)))
+cat(paste("\n    Averge Cor:", round((target_results$corr),2)))
+```
+
+
+
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+
+```
+
+
+
