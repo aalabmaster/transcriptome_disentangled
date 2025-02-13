@@ -1,0 +1,255 @@
+
+---
+title: "Tissue Biomarker Prediction"
+author: "Amir Asiaee"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: yes
+---
+
+```{r globopt, echo=FALSE}
+knitr::opts_chunk$set(fig.width=12) 
+```
+
+```{r mycss, results="asis", echo=FALSE}
+cat('
+<style type="text/css">
+b, strong {color: red; }
+i, em {color: blue; }
+.defn {color: purple; }
+.para {color: purple;
+      font-weight: bold;
+}
+.figure { text-align: center; }
+.caption { font-weight: bold; }
+</style>
+')
+```
+
+# Getting Started
+
+The goal here is to determine the genes that are biomarkers of tissues from external resources and show that we are predicting those genes specifically very well. 
+
+```{r globals}
+rm(list=ls())
+source("00-paths.R")
+ls()
+```
+
+# External Data Source
+Here we used "The Human Protein Atlas" to come up with the tissue markers. Using the following query we extracted the TSV file from their website:
+`tissue_category_rna:any; Tissue enriched AND sort_by:tissue specific score.` The `Tissue enriched` flag tells to select genes that are enriched for any tissue. 
+
+Here, we load the downloaded data:
+
+```{r , warning = FALSE}
+library(readr)
+
+hpa <- read_delim(file.path(paths$raw, "tissue_category_rna_any_Tissue.tsv"), 
+                       delim = "\t", col_names = TRUE, show_col_types = FALSE)
+ncol(hpa)
+colnames(hpa)[1:20]
+
+head(hpa)[18:19]
+hpa_data <- hpa[,c(1, 3, 18:19)]
+```
+The file is sorted based on the tissue specificity score and we also need to extract the tissue name from the 19th column which has both the tissue name and normalized TPM (for protein level expression)
+
+```{r , warning = FALSE}
+library(dplyr)
+library(tidyr)
+
+hpa_parsed <- hpa_data %>%
+  separate(`RNA tissue specific nTPM`,
+           into = c("TissueName", "ExpressionValue"),
+           sep = ": ", 
+           extra = "merge", 
+           fill = "right") %>% 
+  mutate(ExpressionValue = as.numeric(ExpressionValue))
+
+head(hpa_parsed)
+```
+
+Now we need to match the tissue name to that of TCGA's samples. 
+```{r , warning = FALSE}
+unique(hpa_parsed$TissueName)
+```
+```{r , warning = FALSE}
+load(file.path(paths$clean, 'xena-tcga.Rda'))
+cancerType <- as.factor(tcga$tissue)
+unique(cancerType)
+rm(tcga)
+gc()
+```
+Now, afte rmanual inspection, map the tissues that are similar 
+```{r , warning = FALSE}
+mappingDF <- tibble(
+  TissueName = c("breast", "liver", "pancreas",
+                 "thyroid gland", "prostate", "ovary", "endometrium 1",
+                 "urinary bladder", "esophagus", "stomach 1"),
+  TCGA_Code  = c("BRCA",   "LIHC",  "PAAD",
+                 "THCA",   "PRAD", "OV",    "UCEC",
+                 "BLCA",   "ESCA", "STAD")
+)
+
+hpa_filtered <- hpa_parsed %>%
+  inner_join(mappingDF, by = "TissueName")
+
+
+nTPM_cutoff <- 100
+hpa_final <- hpa_filtered %>%
+  filter(ExpressionValue >= nTPM_cutoff)
+
+head(hpa_final)
+rm(hpa, hpa_data, hpa_filtered, hpa_parsed, mappingDF)
+```
+
+# Loading TCGA Prediction Results
+
+```{r , warning = FALSE}
+load(file.path(paths$scratch, 'xena-tcga-agnostic-R2.Rda'))
+r2_tcga_agnostic <- r2s
+rm(r2s)
+
+load(file.path(paths$scratch, 'xena-tcga-aware-R2.Rda'))
+r2_tcga_aware <- r2s
+rm(r2s)
+
+# For some reason the gene ids are missing in the aware model
+names(r2_tcga_aware) <- names(r2_tcga_agnostic)
+
+head(r2_tcga_agnostic)
+head(r2_tcga_aware)
+```
+Let's unify the Ensembl id naming:
+
+```{r , warning = FALSE}
+remove_version <- function(x) sub("\\..*$", "", x)
+
+# Create data.frames with columns "ensembl_id" and "r2"
+r2_agnostic_df <- data.frame(
+  ensembl_id = remove_version(names(r2_tcga_agnostic)),
+  r2_agnostic = as.numeric(r2_tcga_agnostic),
+  stringsAsFactors = FALSE
+)
+
+r2_aware_df <- data.frame(
+  ensembl_id = remove_version(names(r2_tcga_aware)),
+  r2_aware = as.numeric(r2_tcga_aware),
+  stringsAsFactors = FALSE
+)
+
+```
+
+We'll do an inner_join on the "Ensembl" field from hpa_final and the newly created "ensembl_id" columns. That way, we only keep genes that appear in both data sets.
+
+
+```{r , warning = FALSE}
+hpa_final_merged <- hpa_final %>%
+  rename(ensembl_id = Ensembl) %>%
+  inner_join(r2_agnostic_df, by = "ensembl_id") %>%
+  inner_join(r2_aware_df, by = "ensembl_id")
+
+head(hpa_final_merged)
+```
+
+Now, plotting:
+
+```{r , warning = FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr) 
+
+hpa_long <- hpa_final_merged %>%
+  select(ensembl_id, Gene, TissueName, TCGA_Code, r2_agnostic, r2_aware) %>%
+  gather(key = "Model", value = "R2", r2_agnostic, r2_aware) %>%
+  mutate(Model = recode(Model, 
+                        "r2_agnostic" = "Tissue-Agnostic",
+                        "r2_aware" = "Tissue-Aware"))
+
+p_global <- ggplot(hpa_long, aes(x = Model, y = R2)) +
+  geom_violin(trim = FALSE, fill = "lightblue") +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  theme(plot.title = element_text(size = 10)) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Comparison of R² for Tissue-Enriched Marker Genes",
+       x = "Model",
+       y = expression(R^2)) +
+  # Add Wilcoxon signed-rank test annotation
+  stat_compare_means(method = "wilcox.test", paired = TRUE, 
+                     label = "p.signif", 
+                     label.y = 1.0)  # adjust label.y as needed
+
+p_global
+
+fix_tissue_name <- function(x) {
+  x <- recode(x, 
+              "stomach 1" = "Stomach",
+              "urinary bladder" = "Bladder",
+              .default = x)
+  # Capitalize first letter if you'd like (for any not recoded above):
+  substring(x, 1, 1) <- toupper(substring(x, 1, 1))
+  x
+}
+  
+
+hpa_long <- hpa_long %>%
+  mutate(TissueNameClean = fix_tissue_name(TissueName))
+
+library(tibble)
+cohorts_joinable <- cohorts %>%
+  rownames_to_column("TCGA_Code")  # or rename col if needed
+
+hpa_long_colored <- hpa_long %>%
+  left_join(select(cohorts_joinable, TCGA_Code, color),
+            by = "TCGA_Code")
+
+
+p_facet <- ggplot(hpa_long_colored, aes(x = Model, y = R2, fill = color)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white", alpha = 0.4) +
+  scale_fill_identity() +
+  facet_wrap(~ TissueNameClean, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Comparison of R² for Tissue-Enriched Marker Genes (Per-Tissue)",
+    x = "Model",
+    y = expression(R^2)
+  )
+
+p_facet
+
+
+wilcox_test_res <- wilcox.test(
+  hpa_final_merged$r2_agnostic,
+  hpa_final_merged$r2_aware,
+  paired = TRUE
+)
+
+library(patchwork)
+p_global_no_title <- p_global + ggtitle(NULL)
+p_facet_no_title  <- p_facet + ggtitle(NULL)
+
+p_combined <- p_global_no_title + p_facet_no_title +
+  plot_layout(ncol = 2, widths = c(1, 3)) +  # adjust widths as needed
+  plot_annotation(title = "Global and Per-Tissue Comparisons of R² for Tissue-Enriched Marker Genes")
+
+p_combined
+
+ggsave(file.path(paths$scratch, "p_combined.png"), p_combined, width = 12, height = 6, dpi = 300)
+```
+
+# Appendix
+
+This analysis was performed using the following R packages.
+```{r si}
+sessionInfo()
+
+```
+
+
+

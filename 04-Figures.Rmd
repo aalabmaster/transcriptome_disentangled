@@ -488,8 +488,9 @@ save(modAllData, file = mixtureAllDataFileName)
 
 ```
 
-### Tail Analysis
+### Tail Analysis 1 
 ```{r tail , warning = FALSE}
+load(mixtureAllDataFileName)
 avgExpr <- apply(mRNAdata, 1, mean)
 
 find_quantile <- function(V, N) {
@@ -520,7 +521,7 @@ for (i in 1:ncol(allR2)) {
   pThrsh <- qbeta(.05, shape1 = params[2, pIndex], shape2 = params[3, pIndex])
   wThrsh <- qbeta(.99, shape1 = params[2, wIndex], shape2 = params[3, wIndex])
 
-  print(paste("Highest expression among poorly explained lies at the first", round(find_quantile(avgExpr, max(avgExpr[rownames(modAllData)[allR2[,expR2] < pThrsh]])), 3), "quantile."))
+  print(paste("Highest average expression among poorly explained lies at the first", round(find_quantile(avgExpr, max(avgExpr[rownames(modAllData)[allR2[,expR2] < pThrsh]])), 3), "quantile."))
   
   write.csv(rownames(modAllData)[allR2[,expR2] < pThrsh], file = f)
   write.csv(rownames(modAllData)[allR2[,expR2] > wThrsh], file = g)
@@ -528,6 +529,246 @@ for (i in 1:ncol(allR2)) {
 }
 
 
+```
+### Tail Analysis 2
+
+```{r , warning = FALSE}
+
+# Global threshold-based classification
+poor_threshold <- .3  # Defined earlier
+well_threshold <- .7  # Defined earlier
+
+# Find genes that remain poorly explained (Global Threshold)
+poor_to_poor <- rownames(allR2)[(allR2[, "agnostic"] < poor_threshold) & 
+                                (allR2[, "aware"] < poor_threshold)]
+
+# Find genes that remain well explained (Global Threshold)
+well_to_well <- rownames(allR2)[(allR2[, "agnostic"] > well_threshold) & 
+                                (allR2[, "aware"] > well_threshold)]
+
+# Find genes that switch from poor to well explained (Mixture Model)
+switch_poor_to_well <- names(gene_classes_agnostic)[(gene_classes_agnostic == "poor") & 
+                                                    (gene_classes_aware == "well")]
+
+# Identify genes from the "switch_poor_to_well" group with a 4-fold increase in R²
+switch_4fold_increase <- switch_poor_to_well[
+  allR2[switch_poor_to_well, "aware"] > 4 * allR2[switch_poor_to_well, "agnostic"]
+]
+
+cat("Genes Switching from Poor to Well (Mixture Model):", length(switch_poor_to_well), "\n")
+cat("Genes Switching with 4-Fold R² Increase:", length(switch_4fold_increase), "\n")
+cat("Poor → Poor (Global Threshold):", length(poor_to_poor), "\n")
+cat("Well → Well (Global Threshold):", length(well_to_well), "\n")
+
+# Default gray for all genes
+gene_colors <- rep("gray", nrow(allR2))
+
+# Assign colors based on classification
+gene_colors[names(gene_classes_agnostic) %in% switch_poor_to_well] <- "blue"   # Switching genes
+gene_colors[names(gene_classes_agnostic) %in% switch_4fold_increase] <- "orange"  # 2x R² Improvement
+gene_colors[rownames(allR2) %in% poor_to_poor] <- "red"                        # Poorly explained (global threshold)
+gene_colors[rownames(allR2) %in% well_to_well] <- "green"                      # Well explained (global threshold)
+
+library(ggplot2)
+
+# Create a dataframe for ggplot
+plot_data <- data.frame(
+  Agnostic = allR2[, "agnostic"],
+  Aware = allR2[, "aware"],
+  Category = factor(gene_colors, levels = c("red", "green", "blue", "orange", "gray"))  # Preserve color order
+)
+
+# Define colors and correct labels
+color_map <- c("red" = "Poor → Poor (Global)", 
+               "green" = "Well → Well (Global)", 
+               "blue" = "Poor → Well (Mixture)", 
+               "orange" = "Poor → Well (4x R²)", 
+               "gray" = "Other")
+
+# Plot using ggplot2
+ggplot(plot_data, aes(x = Agnostic, y = Aware, color = Category)) +
+  geom_point(size = 1.5, alpha = 0.8) +  # Plot points
+  scale_color_manual(values = names(color_map), labels = color_map) +  # Correct color-label mapping
+  labs(title = "R² Comparison (Agnostic vs. Aware)", 
+       x = "Tissue Agnostic R²", 
+       y = "Tissue Aware R²", 
+       color = "Gene Category") +  # Fix legend title
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") +  # Diagonal reference line
+  geom_hline(yintercept = poor_threshold, linetype = "dotted", color = "red", size = 1) +  # Poor threshold (horizontal)
+  geom_vline(xintercept = poor_threshold, linetype = "dotted", color = "red", size = 1) +  # Poor threshold (vertical)
+  geom_hline(yintercept = well_threshold, linetype = "dotted", color = "green", size = 1) +  # Well threshold (horizontal)
+  geom_vline(xintercept = well_threshold, linetype = "dotted", color = "green", size = 1) +  # Well threshold (vertical)
+  coord_fixed(ratio = 1, xlim = c(0,1), ylim = c(0,1)) +  # Keep aspect ratio and axis limits
+  theme_classic() +
+  theme(legend.position = c(0.75, 0.25))  # Place legend in bottom right
+
+
+# Save gene lists
+write.csv(poor_to_poor, file = file.path(paths$scratch, "poor_to_poor.csv"), row.names = FALSE)
+write.csv(well_to_well, file = file.path(paths$scratch, "well_to_well.csv"), row.names = FALSE)
+write.csv(switch_poor_to_well, file = file.path(paths$scratch, "switch_poor_to_well.csv"), row.names = FALSE)
+write.csv(switch_4fold_increase, file = file.path(paths$scratch, "switch_4fold_increase.csv"), row.names = FALSE)
+
+plot_png <- file.path(paths$scratch, "R2_comparison_plot.png")
+ggsave(plot_png, width = 6, height = 6, dpi = 300)
+
+```
+
+#### Gene Set Enrichment Analysis
+First doing GO and dotplot:
+```{r , warning = FALSE}
+library(clusterProfiler)
+library(enrichplot)
+library(DOSE)
+library(ggplot2)
+library(org.Hs.eg.db)  
+
+
+# Function to convert gene symbols to Entrez IDs
+convert_to_entrez <- function(gene_list) {
+  mapped_genes <- bitr(gene_list, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+  return(mapped_genes$ENTREZID)
+}
+
+# Convert gene lists
+poor_entrez <- convert_to_entrez(poor_to_poor)
+well_entrez <- convert_to_entrez(well_to_well)
+switch_entrez <- convert_to_entrez(switch_4fold_increase)
+
+cat("Converted Gene Counts - Poor:", length(poor_entrez), "Well:", length(well_entrez), "Switch:", length(switch_entrez), "\n")
+
+
+# Perform GO enrichment analysis (Biological Process)
+go_poor <- enrichGO(gene = poor_entrez, OrgDb = org.Hs.eg.db, ont = "BP", pAdjustMethod = "BH", readable = TRUE)
+go_well <- enrichGO(gene = well_entrez, OrgDb = org.Hs.eg.db, ont = "BP", pAdjustMethod = "BH", readable = TRUE)
+go_switch <- enrichGO(gene = switch_entrez, OrgDb = org.Hs.eg.db, ont = "BP", pAdjustMethod = "BH", readable = TRUE)
+
+
+ggsave(file.path(paths$scratch, 'dotplot_poor_path.pdf'), 
+       plot = dotplot(go_poor, showCategory=15) + 
+         ggtitle("GO Enrichment - Poorly Explained Genes") + 
+         theme(axis.text.y = element_text(size = 7)), 
+       width = 7, height = 5, dpi = 300)
+
+ggsave(file.path(paths$scratch, 'dotplot_well_path.pdf'), 
+       plot = dotplot(go_well, showCategory=15) + 
+         ggtitle("GO Enrichment - Well Explained Genes") + 
+         theme(axis.text.y = element_text(size = 7)),
+       width = 7, height = 5, dpi = 300)
+
+ggsave(file.path(paths$scratch, 'dotplot_switch_path.pdf'), 
+       plot = dotplot(go_switch, showCategory=15) + 
+         ggtitle("GO Enrichment - 4-Fold Switch Genes") + 
+         theme(axis.text.y = element_text(size = 7)),
+       width = 7, height = 5, dpi = 300)
+```
+
+Next, the heatmap, we can not have all of the pathways in one figure, we go for the top 15 per gene category:
+```{r , warning = FALSE}
+# Function to extract the top N most significant pathways
+get_top_pathways <- function(enrich_result, N = 15) {
+  if (is.null(enrich_result@result)) return(character(0))  # Return empty if no enrichment found
+  pvals <- enrich_result@result[, c("Description", "p.adjust")]
+  pvals$log_p <- -log10(pvals$p.adjust)  # Convert to -log10 scale
+  top_terms <- head(pvals[order(pvals$log_p, decreasing = TRUE), "Description"], N)  # Select top N
+  return(top_terms)
+}
+
+# Get top 15 pathways per group
+top_well <- get_top_pathways(go_well, N = 15)
+top_switch <- get_top_pathways(go_switch, N = 15)
+top_poor <- get_top_pathways(go_poor, N = 15)
+
+# Combine unique top pathways across all groups
+selected_terms <- unique(c(top_well, top_switch, top_poor))
+```
+
+Now extracting the p-values for heatmap generation:
+```{r , warning = FALSE}
+
+# Function to extract -log10(p.adjust) for pathways
+get_pvalues_matrix <- function(enrich_result, all_terms) {
+  pvals <- enrich_result@result[, c("Description", "p.adjust")]
+  rownames(pvals) <- pvals$Description
+  
+  # Convert to -log10 scale
+  pvals$log_p <- -log10(pvals$p.adjust)
+  
+  # Ensure all pathways are included in the matrix
+  pval_matrix <- data.frame(Pathway = all_terms)
+  pval_matrix$log_p <- ifelse(pval_matrix$Pathway %in% rownames(pvals), 
+                              pvals[match(pval_matrix$Pathway, rownames(pvals)), "log_p"], 
+                              0)  # Assign 0 if not enriched
+  
+  rownames(pval_matrix) <- pval_matrix$Pathway
+  return(pval_matrix$log_p)
+}
+
+# Create matrix of -log10(p.adjust) values
+pval_matrix <- data.frame(
+  Pathway = selected_terms,
+  Poor = get_pvalues_matrix(go_poor, selected_terms),
+  Well = get_pvalues_matrix(go_well, selected_terms),
+  "Switch (4-Fold Increase)"  = get_pvalues_matrix(go_switch, selected_terms)
+)
+
+rownames(pval_matrix) <- pval_matrix$Pathway
+pval_matrix <- pval_matrix[, -1]  # Remove Pathway column for heatmap
+
+# Function to shorten pathway names
+shorten_pathway_names <- function(pathways) {
+  pathways <- gsub("regulation", "reg.", pathways)
+  pathways <- gsub("response", "resp.", pathways)
+  pathways <- gsub("sensory perception of", "sensory perc.", pathways)
+  pathways <- gsub("sensory perception", "sensory perc.", pathways)
+  pathways <- gsub("chromosome segregation", "chr. segregation", pathways)
+  pathways <- gsub("positive regulation of", "pos. reg.", pathways)
+  pathways <- gsub("negative regulation of", "neg. reg.", pathways)
+  pathways <- gsub("natural killer", "nk", pathways)
+  pathways <- gsub("phosphorylation of STAT protein", "STAT phosph.", pathways)
+  pathways <- gsub("detection of chemical stimulus involved in", "chem. detect.", pathways)
+  
+  return(pathways)
+}
+
+# Apply name shortening
+rownames(pval_matrix) <- shorten_pathway_names(rownames(pval_matrix))
+```
+
+Finally, the heatmap:
+```{r , warning = FALSE}
+pdf(file.path(paths$scratch, 'heatmap_go.pdf'), width = 10, height = 6)
+
+# Create and draw the heatmap
+ht <- Heatmap(as.matrix(pval_matrix), 
+        name = "-log10\n(p.adjust)",  
+        col = colorRampPalette(c("blue", "white", "red"))(50),  
+        row_names_side = "left",  
+        cluster_rows = FALSE,  
+        cluster_columns = FALSE,  # Keep fixed column order
+        row_names_gp = gpar(fontsize = 8),  
+        column_names_gp = gpar(fontsize = 9, fontface = "bold"),  # Keep normal size and bold
+        column_title_gp = gpar(fontsize = 10),  # Adjust overall title font size
+        column_names_rot = 0,  
+        column_names_centered = TRUE,  # Ensure text is centered properly
+        heatmap_legend_param = list(title_gp = gpar(fontsize = 8))  
+)
+
+draw(ht, padding = unit(c(10, 8, 10, 8), "mm"))  
+dev.off()
+
+```
+
+We can try doing KEGG enrichment but will not include it in the paper: 
+```{r , warning = FALSE}
+# Perform KEGG enrichment analysis
+kegg_poor <- enrichKEGG(gene = poor_entrez, organism = "hsa", pAdjustMethod = "BH")
+kegg_well <- enrichKEGG(gene = well_entrez, organism = "hsa", pAdjustMethod = "BH")
+kegg_switch <- enrichKEGG(gene = switch_entrez, organism = "hsa", pAdjustMethod = "BH")
+
+dotplot(kegg_poor, showCategory=15) + ggtitle("KEGG Enrichment - Poorly Explained Genes")
+dotplot(kegg_well, showCategory=15) + ggtitle("KEGG Enrichment - Well Explained Genes")
+dotplot(kegg_switch, showCategory=15) + ggtitle("KEGG Enrichment - 4-Fold Switch Genes")
 ```
 
 
